@@ -108,6 +108,9 @@ static inline int munmap(void* addr, size_t /*length*/) {
 #include <chrono>
 #include <cstdlib>
 #include <algorithm>
+#include <thread>
+#include <vector>
+#include <atomic>
 
 #include "gpu_compat.h"
 #include "ext.hpp"
@@ -955,6 +958,91 @@ cpp_metrics_t get_cpp_metrics() {
 
 // Bindings
 
+// Multithreaded O_DIRECT range reader for the unified-memory copier.
+// Reads ONLY the given [start, end) file byte-runs (e.g. the experts an EP rank
+// owns, from SafeTensorsMetadata.select_byte_ranges) straight into the device
+// buffer, placing file byte F at gbuf[F - header_len]. Work is byte-balanced
+// across the concatenated owned-byte space so one large run + many small runs
+// still spreads evenly; thread boundaries that land mid-run align the O_DIRECT
+// offset down and overlapping reads write identical bytes (idempotent). Uses the
+// dlopen'd cuda_fns table (no cudart link) — pinned bounce + sync cudaMemcpy.
+static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
+                         size_t header_len,
+                         const std::vector<size_t> &starts,
+                         const std::vector<size_t> &ends, int nthreads) {
+    if (!cuda_fns.cudaHostAlloc || !cuda_fns.cudaMemcpy || !cuda_fns.cudaFreeHost
+        || !cuda_fns.cudaDeviceSynchronize) {
+        return -10;
+    }
+    const size_t n_runs = starts.size();
+    if (n_runs == 0 || ends.size() != n_runs) return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < n_runs; i++) total += ends[i] - starts[i];
+    if (total == 0) return 0;
+    if (nthreads < 1) nthreads = 4;
+    if (nthreads > 32) nthreads = 32;
+
+    char *gbuf = reinterpret_cast<char *>(gbuf_dev);
+    const size_t CHUNK = 16UL << 20;
+    const size_t ALN = 4096UL;
+    std::atomic<int> rc{0};
+    std::vector<std::thread> threads;
+
+    for (int ti = 0; ti < nthreads; ti++) {
+        size_t gbs = (size_t)((double)ti * total / nthreads);
+        size_t gbe = (ti == nthreads - 1) ? total
+                                          : (size_t)((double)(ti + 1) * total / nthreads);
+        if (gbe <= gbs) continue;
+        threads.emplace_back([&, gbs, gbe]() {
+            void *pinned = nullptr;
+            if (cuda_fns.cudaHostAlloc(&pinned, CHUNK, 0) != cudaSuccess) {
+                rc = -1;
+                return;
+            }
+            int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+            if (fd < 0) {
+                rc = -2;
+                cuda_fns.cudaFreeHost(pinned);
+                return;
+            }
+            size_t cum = 0;
+            for (size_t r = 0; r < n_runs && rc.load() == 0; r++) {
+                size_t rs = starts[r], re = ends[r], rlen = re - rs;
+                size_t b0 = cum, b1 = cum + rlen;  // this run in owned-byte space
+                cum = b1;
+                size_t ov0 = b0 > gbs ? b0 : gbs;  // overlap with my span
+                size_t ov1 = b1 < gbe ? b1 : gbe;
+                if (ov0 >= ov1) continue;
+                size_t fstart = rs + (ov0 - b0);   // file coords of my portion
+                size_t fend = rs + (ov1 - b0);
+                size_t astart = fstart & ~(ALN - 1);  // align O_DIRECT offset down
+                for (size_t fo = astart; fo < fend; fo += CHUNK) {
+                    size_t want = fend - fo;
+                    size_t reqlen = (want >= CHUNK) ? CHUNK
+                                                    : ((want + ALN - 1) & ~(ALN - 1));
+                    ssize_t got = pread(fd, pinned, reqlen, fo);
+                    if (got <= 0) { rc = -3; break; }
+                    size_t fo_end = fo + (size_t)got;
+                    size_t cs = fo > fstart ? fo : fstart;  // copy only [fstart,fend)
+                    size_t ce = fo_end < fend ? fo_end : fend;
+                    if (cs < ce) {
+                        cudaError_t e = cuda_fns.cudaMemcpy(
+                            gbuf + (cs - header_len), (char *)pinned + (cs - fo),
+                            ce - cs, cudaMemcpyHostToDevice);
+                        if (e != cudaSuccess) { rc = -4; break; }
+                    }
+                    if (fo_end >= fend) break;
+                }
+            }
+            close(fd);
+            cuda_fns.cudaFreeHost(pinned);
+        });
+    }
+    for (auto &t : threads) t.join();
+    cuda_fns.cudaDeviceSynchronize();
+    return rc.load();
+}
+
 // Async host-to-device memcpy for unified memory copier
 static int memcpy_h2d_async(uintptr_t dst, uintptr_t src, size_t size) {
     if (!cuda_fns.cudaMemcpyAsync) {
@@ -996,6 +1084,17 @@ PYBIND11_MODULE(__MOD_NAME__, m)
     m.def("load_library_functions", &load_library_functions,
           pybind11::arg("cudart_lib_name") = "");
     m.def("memcpy_h2d_async", &memcpy_h2d_async);
+    m.def(
+        "dma_load_runs",
+        [](uintptr_t gbuf_dev, const std::string &path, size_t header_len,
+           const std::vector<size_t> &starts, const std::vector<size_t> &ends,
+           int nthreads) {
+            pybind11::gil_scoped_release release;  // blocking O_DIRECT + DMA
+            return dma_load_runs(gbuf_dev, path, header_len, starts, ends, nthreads);
+        },
+        pybind11::arg("gbuf_dev"), pybind11::arg("path"),
+        pybind11::arg("header_len"), pybind11::arg("starts"),
+        pybind11::arg("ends"), pybind11::arg("nthreads") = 8);
     m.def("get_cpp_metrics", &get_cpp_metrics);
     m.def("set_gil_release", &set_gil_release);
     m.def("get_gil_release", &get_gil_release);
