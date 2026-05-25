@@ -18,7 +18,9 @@ def MyExtension(name, sources, mod_name, *args, **kwargs):
         f"{pybind11_path}/include"
     ]
     kwargs["language"] = "c++"
-    kwargs["extra_compile_args"] = ["-fvisibility=hidden", "-std=c++17"]
+    # -pthread: the unified copier's dma_load_runs O_DIRECT reader uses std::thread.
+    kwargs["extra_compile_args"] = ["-fvisibility=hidden", "-std=c++17", "-pthread"]
+    kwargs["extra_link_args"] = ["-pthread"]
 
     # Windows-specific configuration for DirectStorage + D3D12/CUDA interop
     if platform.system() == "Windows":
@@ -26,6 +28,7 @@ def MyExtension(name, sources, mod_name, *args, **kwargs):
         kwargs["libraries"] = []
         # c++20 required for designated initializers at ext.hpp
         kwargs["extra_compile_args"] = ["/std:c++20"]
+        kwargs["extra_link_args"] = []
         # Note: dstorage.dll is loaded at runtime via LoadLibrary, not linked.
         kwargs["libraries"].extend(["ole32", "d3d12", "dxgi", "dxguid", "uuid"])
 

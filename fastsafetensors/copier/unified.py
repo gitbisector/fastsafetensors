@@ -42,6 +42,8 @@ class UnifiedMemCopier(CopierInterface):
         self._file_tensor: Optional[torch.Tensor] = None
         self._pinned: List[torch.Tensor] = []
         self.byte_ranges: Optional[List[Tuple[int, int]]] = None
+        # Worker count for the C++ O_DIRECT range reader (dma_load_runs).
+        self._dma_threads = int(os.getenv("FASTSAFETENSORS_DMA_THREADS", "8"))
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
@@ -63,23 +65,43 @@ class UnifiedMemCopier(CopierInterface):
         # Allocate CUDA buffer via framework's allocator (proper lifecycle)
         gbuf = self.framework.alloc_tensor_memory(data_length, self.device)
 
-        # mmap the file (lazy, no I/O yet)
-        file_tensor = torch.from_file(
-            self.metadata.src, size=self.metadata.size_bytes, dtype=torch.uint8
-        )
-        self._file_tensor = file_tensor
-
         # Default to the whole data section, reproducing the full-file read.
         # An empty list (vs None) reads nothing — same semantics as nogds.
         runs = self.byte_ranges
         if runs is None:
             runs = [(header_length, self.metadata.size_bytes)]
 
+        # Fast path: the C++ multithreaded O_DIRECT range reader copies only the
+        # given runs straight into gbuf (no mmap / page cache), placing file byte
+        # F at gbuf[F - header_length].
+        dma_load_runs = getattr(fstcpp, "dma_load_runs", None)
+        if dma_load_runs is not None:
+            starts = [s for s, _ in runs]
+            ends = [e for _, e in runs]
+            rc = dma_load_runs(
+                gbuf.get_base_address(),
+                self.metadata.src,
+                header_length,
+                starts,
+                ends,
+                self._dma_threads,
+            )
+            if rc == 0:
+                return gbuf
+            print(
+                f"[unified] dma_load_runs rc={rc}; falling back to pin_memory "
+                f"for {self.metadata.src}",
+                flush=True,
+            )
+
+        # Fallback: mmap + per-run pin_memory + async H2D.
+        file_tensor = torch.from_file(
+            self.metadata.src, size=self.metadata.size_bytes, dtype=torch.uint8
+        )
+        self._file_tensor = file_tensor
         base_address = gbuf.get_base_address()
         self._pinned = []
         for start, end in runs:
-            # pin_memory faults in + pins only this run's pages, then DMA to the
-            # matching offset in gbuf (data section starts at header_length).
             pinned = file_tensor[start:end].pin_memory()
             self._pinned.append(pinned)
             ret = fstcpp.memcpy_h2d_async(  # type: ignore[attr-defined]
