@@ -37,6 +37,31 @@ def is_gpu_found():
     return fstcpp.is_cuda_found() or fstcpp.is_hip_found()
 
 
+def get_fs_type(path: str, mounts_file: str = "/proc/mounts") -> str:
+    """Best-effort filesystem type for *path* (longest mount-point prefix
+    match). Returns "" when it cannot be determined (non-Linux, unreadable
+    mounts table). Used to pick I/O strategies -- e.g. O_DIRECT is a win on
+    local block devices but loses kernel readahead on network filesystems.
+    """
+    try:
+        real = os.path.realpath(path)
+        best_mnt, best_type = "", ""
+        with open(mounts_file) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                # /proc/mounts octal-escapes spaces and tabs in mount points
+                mnt = parts[1].replace("\\040", " ").replace("\\011", "\t")
+                fstype = parts[2]
+                if real == mnt or real.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > len(best_mnt):
+                        best_mnt, best_type = mnt, fstype
+        return best_type
+    except OSError:
+        return ""
+
+
 def get_device_numa_node(device: Optional[int]) -> Optional[int]:
     if device is None or not sys.platform.startswith("linux"):
         return None

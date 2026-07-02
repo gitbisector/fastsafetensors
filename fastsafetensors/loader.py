@@ -10,6 +10,7 @@ from typing import (
     Mapping,
     Optional,
     OrderedDict,
+    Set,
     Tuple,
     Union,
 )
@@ -75,6 +76,10 @@ class BaseSafeTensorsFileLoader:
         self.frames = OrderedDict[str, TensorFrame]()
         self.disable_cache = disable_cache
         self._tensor_filter: Optional[Callable[[str], bool]] = None
+        # realpath -> (chunk tensor names, byte-ranges) for the next
+        # copy_files_to_device; set by PipelineParallel when max_batch_bytes is
+        # active so each file loads only a sub-file chunk. Empty = whole files.
+        self._chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
         self.init_numa(set_numa)
         self.copier_constructor: CopierConstructFunc = create_copier_constructor(
             copier_type=copier_type,
@@ -91,9 +96,19 @@ class BaseSafeTensorsFileLoader:
                 fstcpp.set_numa_node(node)
             gl_set_numa = True
 
+    def set_chunk_plan(
+        self, chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]]
+    ) -> None:
+        """Load only a sub-file chunk of each listed file on the next
+        copy_files_to_device: ``realpath -> (tensor names, byte-ranges)``. The
+        copier allocates just the chunk's span (see ``set_chunk``) and only the
+        named tensors are registered. Used by max_batch_bytes batching."""
+        self._chunk_plan = chunk_plan
+
     def reset(self):
         self.frames = {}
         self.meta = {}
+        self._chunk_plan = {}
 
     def close(self):
         self.reset()
@@ -171,11 +186,15 @@ class BaseSafeTensorsFileLoader:
 
         factory_idx_bits = math.ceil(math.log2(len(self.meta) + 1))
         lidx = 1
-        for _, (meta, rank) in sorted(self.meta.items(), key=lambda x: x[0]):
+        for realpath, (meta, rank) in sorted(self.meta.items(), key=lambda x: x[0]):
             self_rank = self.pg.rank() == rank
             if self_rank:
                 copier = self.copier_constructor(meta, self.device, self.framework)
-                if self._tensor_filter is not None:
+                chunk = self._chunk_plan.get(realpath)
+                if chunk is not None and hasattr(copier, "set_chunk"):
+                    names, ranges = chunk
+                    copier.set_chunk(ranges, names)
+                elif self._tensor_filter is not None:
                     copier.set_byte_ranges(meta.select_byte_ranges(self._tensor_filter))
             else:
                 copier = None
@@ -197,11 +216,17 @@ class BaseSafeTensorsFileLoader:
             lidx += 1
         for factory in need_wait:
             factory.wait_io(dtype=dtype, noalign=False)
+        if self._chunk_plan:
+            # Only this sub-batch's chunk tensors should be registered/visible.
+            chunk_keys = set().union(*(names for names, _ in self._chunk_plan.values()))
+            keep_tensor: Optional[Callable[[str], bool]] = lambda n: n in chunk_keys
+        else:
+            keep_tensor = self._tensor_filter
         return FilesBufferOnDevice(
             factories,
             pg=self.pg,
             framework=self.framework,
-            keep_tensor=self._tensor_filter,
+            keep_tensor=keep_tensor,
         )
 
 

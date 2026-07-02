@@ -16,11 +16,52 @@ import os
 from typing import Dict, List, Optional, Set, Tuple
 
 from .. import cpp as fstcpp
-from ..common import SafeTensorsMetadata
+from ..common import SafeTensorsMetadata, get_fs_type, init_logger
 from ..frameworks import FrameworkOpBase, TensorBase
 from ..st_types import Device, DType
 from .base import CopierInterface, validated_byte_ranges
 from .registry import CopierConstructFunc, register_copier_constructor
+
+logger = init_logger(__name__)
+
+# O_DIRECT bypasses the page cache, which wins on local block devices but
+# forfeits kernel readahead / client caching on network filesystems, where the
+# buffered mmap + pin path performs better. Gate the fast path by fs type;
+# FASTSAFETENSORS_ODIRECT=1/0 forces it on/off regardless.
+_NETWORK_FS = {
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "fuse.sshfs",
+    "lustre",
+    "gpfs",
+    "beegfs",
+    "glusterfs",
+    "ceph",
+    "9p",
+    "virtiofs",
+}
+_warned_fs: set = set()
+
+
+def _odirect_ok(path: str) -> bool:
+    override = os.environ.get("FASTSAFETENSORS_ODIRECT")
+    if override is not None:
+        return override == "1"
+    fstype = get_fs_type(path)
+    if fstype in _NETWORK_FS:
+        if fstype not in _warned_fs:
+            _warned_fs.add(fstype)
+            logger.info(
+                "checkpoint on network filesystem (%s): using buffered reads "
+                "instead of O_DIRECT (set FASTSAFETENSORS_ODIRECT=1 to force)",
+                fstype,
+            )
+        return False
+    return True
 
 
 class UnifiedMemCopier(CopierInterface):
@@ -45,6 +86,11 @@ class UnifiedMemCopier(CopierInterface):
         self.byte_ranges: Optional[List[Tuple[int, int]]] = None
         self._chunk_names: Optional[Set[str]] = None
         self._base_off = metadata.header_length
+        # Worker count for the C++ O_DIRECT range reader (dma_load_runs). Single
+        # -thread pin_memory is page-cache-bound (~2.5 GB/s); O_DIRECT threads
+        # bypass the cache and drive NVMe queue depth. Falls back to pin_memory
+        # if the reader is unavailable.
+        self._dma_threads = int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8"))
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
@@ -90,6 +136,31 @@ class UnifiedMemCopier(CopierInterface):
 
         # Allocate CUDA buffer via framework's allocator (proper lifecycle)
         gbuf = self.framework.alloc_tensor_memory(alloc_length, self.device)
+
+        # Fast path: multithreaded O_DIRECT reader copies only the runs straight
+        # into gbuf (byte F -> gbuf[F - base_off]), bypassing the page cache and
+        # single-thread pin. Works for both full and compact-chunk buffers.
+        # FASTSAFETENSORS_DMA_THREADS=0 disables it (falls back to mmap + pin);
+        # network filesystems fall back automatically (see _odirect_ok).
+        dma_load_runs = getattr(fstcpp, "dma_load_runs", None)
+        if (
+            dma_load_runs is not None
+            and self._dma_threads > 0
+            and _odirect_ok(self.metadata.src)
+        ):
+            starts = [s for s, _ in runs]
+            ends = [e for _, e in runs]
+            rc = dma_load_runs(
+                gbuf.get_base_address(),
+                self.metadata.src,
+                base_off,
+                starts,
+                ends,
+                self._dma_threads,
+            )
+            if rc == 0:
+                return gbuf
+            # Non-zero: reader unusable here; fall back to mmap + pin_memory.
 
         base_address = gbuf.get_base_address()
         self._pinned = []

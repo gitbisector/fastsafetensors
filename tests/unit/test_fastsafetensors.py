@@ -400,6 +400,9 @@ def test_UnifiedMemCopier(fstcpp_log, input_files, framework, monkeypatch) -> No
         monkeypatch.setattr(fstcpp, "memcpy_h2d_async", fake_memcpy_h2d_async)
         monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
+    # This test exercises the mmap + pin_memory flow; disable the O_DIRECT
+    # fast path so the monkeypatched primitives are actually used.
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "0")
     copier = UnifiedMemCopier(meta, device, framework)
     gbuf = copier.submit_io(False, 10 * 1024 * 1024 * 1024)
     tensors = copier.wait_io(gbuf)
@@ -426,6 +429,9 @@ def test_UnifiedMemCopier_cuda_error(
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
     monkeypatch.setattr(fstcpp, "memcpy_h2d_async", lambda dst, src, size: 99)
 
+    # Error injection targets the pin path; the O_DIRECT fast path would
+    # succeed and never hit the monkeypatched memcpy.
+    monkeypatch.setenv("FASTSAFETENSORS_DMA_THREADS", "0")
     copier = UnifiedMemCopier(meta, device, framework)
     with pytest.raises(RuntimeError, match="99"):
         copier.submit_io(False, 10 * 1024 * 1024 * 1024)
