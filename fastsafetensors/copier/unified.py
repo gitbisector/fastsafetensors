@@ -13,7 +13,7 @@ module never imports torch or paddle directly.
 """
 
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .. import cpp as fstcpp
 from ..common import SafeTensorsMetadata
@@ -43,6 +43,8 @@ class UnifiedMemCopier(CopierInterface):
         self.framework = framework
         self._pinned: List[TensorBase] = []
         self.byte_ranges: Optional[List[Tuple[int, int]]] = None
+        self._chunk_names: Optional[Set[str]] = None
+        self._base_off = metadata.header_length
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
@@ -55,14 +57,20 @@ class UnifiedMemCopier(CopierInterface):
         """
         self.byte_ranges = validated_byte_ranges(self.metadata, byte_ranges)
 
+    def set_chunk(self, byte_ranges: List[Tuple[int, int]], names: Set[str]) -> None:
+        """Load only ``names`` into a buffer sized to those tensors' span.
+
+        Allocates only ``max_end - min_start`` of the runs and instantiates just
+        ``names``, so peak device memory is bounded by the chunk rather than the
+        shard -- the building block for ``max_batch_bytes`` sub-file batching.
+        """
+        self.byte_ranges = byte_ranges
+        self._chunk_names = names
+
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
     ) -> fstcpp.gds_device_buffer:
         header_length = self.metadata.header_length
-        data_length = self.metadata.size_bytes - header_length
-
-        # Allocate CUDA buffer via framework's allocator (proper lifecycle)
-        gbuf = self.framework.alloc_tensor_memory(data_length, self.device)
 
         # Default to the whole data section, reproducing the full-file read.
         # An empty list (vs None) reads nothing — same semantics as nogds.
@@ -70,18 +78,31 @@ class UnifiedMemCopier(CopierInterface):
         if runs is None:
             runs = [(header_length, self.metadata.size_bytes)]
 
+        if self._chunk_names is not None:
+            # Compact chunk: allocate only the runs' span and map gbuf[0] to the
+            # first run's start, so peak memory tracks the chunk, not the shard.
+            base_off = min(s for s, _ in runs)
+            alloc_length = max(e for _, e in runs) - base_off
+        else:
+            base_off = header_length
+            alloc_length = self.metadata.size_bytes - header_length
+        self._base_off = base_off
+
+        # Allocate CUDA buffer via framework's allocator (proper lifecycle)
+        gbuf = self.framework.alloc_tensor_memory(alloc_length, self.device)
+
         base_address = gbuf.get_base_address()
         self._pinned = []
         for start, end in runs:
             # mmap_file_pinned faults in + pins only this run's pages
             # (kernel readahead + DMA-ready), then DMA to the matching offset in
-            # gbuf (data section starts at header_length).
+            # gbuf (gbuf[0] maps to file offset base_off).
             pinned = self.framework.mmap_file_pinned(
                 self.metadata.src, end - start, start
             )
             self._pinned.append(pinned)
             ret = fstcpp.memcpy_h2d_async(  # type: ignore[attr-defined]
-                base_address + (start - header_length),
+                base_address + (start - base_off),
                 pinned.data_ptr(),
                 end - start,
             )
@@ -107,7 +128,7 @@ class UnifiedMemCopier(CopierInterface):
         # address. The copy_start_offset=header_length cancels out in get_tensors'
         # pointer arithmetic, giving correct offsets. No memmove fixup needed.
         tensors = self.metadata.get_tensors(
-            gbuf, self.device, self.metadata.header_length, dtype=dtype
+            gbuf, self.device, self._base_off, dtype=dtype, names=self._chunk_names
         )
 
         # Release the pinned mmap pages

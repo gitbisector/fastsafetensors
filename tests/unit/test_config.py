@@ -364,6 +364,7 @@ class TestLoaderConfigKwargsHelpers:
             "max_concurrent_producers": 1,
             "queue_size": 2,
             "use_tqdm_on_load": False,
+            "max_batch_bytes": None,
         }
 
     def test_create_parallel_kwargs_pipeline_disabled(self):
@@ -374,7 +375,10 @@ class TestLoaderConfigKwargsHelpers:
             use_tqdm_on_load=False,
         )
         kwargs = config.create_parallel_kwargs()
-        assert kwargs == {"queue_size": -1}
+        assert kwargs == {
+            "queue_size": -1,
+            "max_batch_bytes": None,
+        }
 
     def test_max_concurrent_producers_validation(self):
         """max_concurrent_producers != 1 should raise ValueError."""

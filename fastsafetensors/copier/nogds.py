@@ -2,7 +2,7 @@
 
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .. import cpp as fstcpp
 from ..common import (
@@ -40,6 +40,8 @@ class NoGdsFileCopier(CopierInterface):
         self.device = device
         self.reqs: List[int] = []
         self.byte_ranges: Optional[List[Tuple[int, int]]] = None
+        self._chunk_names: Optional[Set[str]] = None
+        self._base_off = metadata.header_length
 
     def set_byte_ranges(self, byte_ranges: Optional[List[Tuple[int, int]]]) -> None:
         """Restrict reads to these ``[start, end)`` absolute file-offset runs.
@@ -51,26 +53,44 @@ class NoGdsFileCopier(CopierInterface):
         """
         self.byte_ranges = validated_byte_ranges(self.metadata, byte_ranges)
 
+    def set_chunk(self, byte_ranges: List[Tuple[int, int]], names: Set[str]) -> None:
+        """Load only ``names`` into a device buffer sized to those tensors' span.
+
+        Unlike ``set_byte_ranges`` (which still allocates the whole data section
+        and leaves it sparsely filled), this allocates only
+        ``max_end - min_start`` of the runs and instantiates just ``names`` --
+        so peak device memory is bounded by the chunk, not the shard. This is
+        the building block for ``max_batch_bytes`` sub-file batching.
+        """
+        self.byte_ranges = byte_ranges
+        self._chunk_names = names
+
     def submit_io(
         self, use_buf_register: bool, max_copy_block_size: int
     ) -> fstcpp.gds_device_buffer:
         header_length = self.metadata.header_length
-        total_length = self.metadata.size_bytes - header_length
-        gbuf = self.framework.alloc_tensor_memory(total_length, self.device)
         # Default to a single run spanning the whole data section, which
         # reproduces the original full-file read.
         runs = self.byte_ranges
         if runs is None:
             runs = [(header_length, self.metadata.size_bytes)]
+        if self._chunk_names is not None:
+            # Compact chunk: allocate only the runs' span and map gbuf[0] to the
+            # first run's start, so peak memory tracks the chunk, not the shard.
+            base_off = min(s for s, _ in runs)
+            alloc_length = max(e for _, e in runs) - base_off
+        else:
+            base_off = header_length
+            alloc_length = self.metadata.size_bytes - header_length
+        self._base_off = base_off
+        gbuf = self.framework.alloc_tensor_memory(alloc_length, self.device)
         for start, end in runs:
             count = start
             while count < end:
                 l = end - count
                 if max_copy_block_size < l:
                     l = max_copy_block_size
-                req = self.reader.submit_read(
-                    self.fd, gbuf, count, l, count - header_length
-                )
+                req = self.reader.submit_read(self.fd, gbuf, count, l, count - base_off)
                 if req < 0:
                     raise Exception(f"submit_io: submit_nogds_read failed, err={req}")
                 self.reqs.append(req)
@@ -96,7 +116,7 @@ class NoGdsFileCopier(CopierInterface):
         if len(failed) > 0:
             raise Exception(f"wait_io: wait_nogds_read failed, reqs={failed}")
         return self.metadata.get_tensors(
-            gbuf, self.device, self.metadata.header_length, dtype=dtype
+            gbuf, self.device, self._base_off, dtype=dtype, names=self._chunk_names
         )
 
 

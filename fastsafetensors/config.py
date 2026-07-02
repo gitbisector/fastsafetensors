@@ -3,7 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from .common import init_logger
 
@@ -32,6 +32,11 @@ class LoaderConfig:
     max_concurrent_producers: int = 1
     queue_size: int = 0
     use_tqdm_on_load: bool = True
+
+    # Cap peak device-buffer bytes per rank by loading each shard in sub-file
+    # chunks (load -> [broadcast] -> release). None keeps whole-shard loading.
+    # Must be >= the largest single tensor. See SafeTensorsMetadata.plan_chunks.
+    max_batch_bytes: Optional[int] = None
 
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
