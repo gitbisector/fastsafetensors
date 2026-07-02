@@ -111,6 +111,7 @@ static inline int munmap(void* addr, size_t /*length*/) {
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 #include "gpu_compat.h"
 #include "ext.hpp"
@@ -984,6 +985,33 @@ cpp_metrics_t get_cpp_metrics() {
 // which buffered mmap+pin cannot. Uses the dlopen'd cuda_fns table (no cudart
 // link) -- pinned bounce + sync cudaMemcpy. header_len is the buffer-base offset,
 // so a compacted chunk buffer passes its span start instead of the real header.
+// Reusable pinned 16MB bounce buffers, shared across dma_load_runs calls (and
+// concurrent producers). Chunked loading makes many small calls; recycling the
+// pinned buffers avoids a cudaHostAlloc/cudaFreeHost per chunk per thread.
+static std::mutex g_pin_mtx;
+static std::vector<void *> g_pin_pool;
+static const size_t PIN_CHUNK = 16UL << 20;
+
+static void *pin_acquire() {
+    {
+        std::lock_guard<std::mutex> lk(g_pin_mtx);
+        if (!g_pin_pool.empty()) {
+            void *p = g_pin_pool.back();
+            g_pin_pool.pop_back();
+            return p;
+        }
+    }
+    void *p = nullptr;
+    if (cuda_fns.cudaHostAlloc(&p, PIN_CHUNK, 0) != cudaSuccess) return nullptr;
+    return p;
+}
+
+static void pin_release(void *p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> lk(g_pin_mtx);
+    g_pin_pool.push_back(p);
+}
+
 static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                          size_t header_len,
                          const std::vector<size_t> &starts,
@@ -1012,15 +1040,15 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                                           : (size_t)((double)(ti + 1) * total / nthreads);
         if (gbe <= gbs) continue;
         threads.emplace_back([&, gbs, gbe]() {
-            void *pinned = nullptr;
-            if (cuda_fns.cudaHostAlloc(&pinned, CHUNK, 0) != cudaSuccess) {
+            void *pinned = pin_acquire();
+            if (!pinned) {
                 rc = -1;
                 return;
             }
             int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
             if (fd < 0) {
                 rc = -2;
-                cuda_fns.cudaFreeHost(pinned);
+                pin_release(pinned);
                 return;
             }
             size_t cum = 0;
@@ -1053,7 +1081,7 @@ static int dma_load_runs(uintptr_t gbuf_dev, const std::string &path,
                 }
             }
             close(fd);
-            cuda_fns.cudaFreeHost(pinned);
+            pin_release(pinned);
         });
     }
     for (auto &t : threads) t.join();

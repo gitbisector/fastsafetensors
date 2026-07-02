@@ -191,7 +191,18 @@ class BaseSafeTensorsFileLoader:
             if self_rank:
                 copier = self.copier_constructor(meta, self.device, self.framework)
                 chunk = self._chunk_plan.get(realpath)
-                if chunk is not None and hasattr(copier, "set_chunk"):
+                if chunk is not None:
+                    if not hasattr(copier, "set_chunk"):
+                        # Silently loading the whole file per chunk-batch would
+                        # both break the memory bound and multiply full-file
+                        # reads -- refuse instead.
+                        raise NotImplementedError(
+                            f"sub-file chunking (max_batch_bytes / "
+                            f"device_memory_budget) requires a copier with "
+                            f"set_chunk; {type(copier).__name__} loads whole "
+                            f"files. Use the nogds or unified copier, or unset "
+                            f"the chunking options."
+                        )
                     names, ranges = chunk
                     copier.set_chunk(ranges, names)
                 elif self._tensor_filter is not None:

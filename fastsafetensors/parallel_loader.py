@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 import time
-from typing import Any, Callable, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union
 
 try:
     from tqdm.auto import tqdm
@@ -18,7 +18,7 @@ except ImportError:
 
 
 from . import cpp as fstcpp
-from .common import SingleGroup
+from .common import SafeTensorsMetadata, SingleGroup
 from .frameworks import FrameworkOpBase
 from .loader import BaseSafeTensorsFileLoader, SafeTensorsFileLoader
 
@@ -139,6 +139,7 @@ class PipelineParallel:
         queue_size: int = 0,
         use_tqdm_on_load: bool = True,
         tensor_filter: Optional[Callable[[str], bool]] = None,
+        max_batch_bytes: Optional[int] = None,
         **kwargs,
     ):
 
@@ -168,8 +169,12 @@ class PipelineParallel:
         self.max_concurrent_producers = max_concurrent_producers
         self.queue_size = queue_size
         self.use_tqdm_on_load = use_tqdm_on_load
+        # When set, each shard is loaded in sub-file chunks (span <= this many
+        # bytes) so peak device buffer per rank is bounded regardless of shard
+        # size. See SafeTensorsMetadata.plan_chunks / CopierInterface.set_chunk.
+        self.max_batch_bytes = max_batch_bytes
 
-        # Batch files
+        # Batch files (or, with max_batch_bytes, sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
 
         # Producer-consumer communication
@@ -198,7 +203,7 @@ class PipelineParallel:
 
         fstcpp.set_gil_release(True)
 
-    def _create_batches(self, pg) -> List[List[str]]:
+    def _create_batches(self, pg) -> List[List[Any]]:
         """Create file batches based on distributed settings.
 
         In distributed mode, files are grouped by the process group size so that
@@ -212,10 +217,43 @@ class PipelineParallel:
                             files for all processes in the group
         """
         batch_size = pg.size()
-        return [
+        file_batches = [
             self.hf_weights_files[i : i + batch_size]
             for i in range(0, len(self.hf_weights_files), batch_size)
         ]
+        if self.max_batch_bytes is None:
+            return file_batches
+        # Sub-file chunking: expand each file-batch (one file per rank) into
+        # aligned chunk-batches. Chunk-batch j holds rank r's j-th chunk (or
+        # None once that rank's file runs out), so every rank issues the same
+        # broadcast sequence in lockstep. Header reads are deterministic, so all
+        # ranks build identical batches. Each shard stays owned by one rank and
+        # is loaded in chunks over successive batches -> peak buffer bounded by
+        # max_batch_bytes per rank.
+        keep = self.loader._tensor_filter
+        fw = self.loader.framework
+        chunk_batches: List[List[Any]] = []
+        for group in file_batches:
+            planned = [
+                (
+                    f,
+                    SafeTensorsMetadata.from_file(f, fw).plan_chunks(
+                        self.max_batch_bytes, keep_tensor=keep
+                    ),
+                )
+                for f in group
+            ]
+            maxn = max((len(chunks) for _, chunks in planned), default=0)
+            for j in range(maxn):
+                spec: List[Any] = []
+                for f, chunks in planned:
+                    if j < len(chunks):
+                        names, ranges = chunks[j]
+                        spec.append((f, names, ranges))
+                    else:
+                        spec.append(None)
+                chunk_batches.append(spec)
+        return chunk_batches
 
     def _log_message(self, message: str, is_error: bool = False):
         """Unified logging method for conditional print statements.
@@ -229,7 +267,26 @@ class PipelineParallel:
     def _log_error(self, message: str):
         self._log_message(message, is_error=True)
 
-    def _load_single_batch(self, batch_id: int, file_list: List[str]):
+    def _spec_to_maps(self, spec: List[Any]):
+        """Turn a batch spec into (rank_file_map, chunk_plan).
+
+        Without max_batch_bytes the spec is a list of files (one per rank). With
+        it, the spec is a chunk-batch: per rank, either (file, names, ranges) or
+        None (that rank has no chunk this batch).
+        """
+        if self.max_batch_bytes is None:
+            return {i: [f] for i, f in enumerate(spec)}, None
+        rank_file_map: Dict[int, List[str]] = {}
+        chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
+        for r, entry in enumerate(spec):
+            if entry is None:
+                continue
+            f, names, ranges = entry
+            rank_file_map[r] = [f]
+            chunk_plan[f] = (names, ranges)
+        return rank_file_map, chunk_plan
+
+    def _load_single_batch(self, batch_id: int, file_list: List[Any]):
         """Load a single batch into device memory.
 
         This method handles the complete process of loading a batch of files:
@@ -253,11 +310,12 @@ class PipelineParallel:
             return
 
         try:
-            # Prepare file mapping
-            rank_file_map = {i: [f] for i, f in enumerate(file_list)}
+            rank_file_map, chunk_plan = self._spec_to_maps(file_list)
 
             with TimingContext("add_filenames", self._log_message, batch_id) as timer:
                 self.loader.add_filenames(rank_file_map)
+                if chunk_plan is not None:
+                    self.loader.set_chunk_plan(chunk_plan)
             add_filenames_time = timer.elapsed_ms
 
             # For unbuffered behavior, wait for consumer to process previous item
@@ -492,6 +550,7 @@ class ParallelLoader(PipelineParallel):
         framework="pytorch",
         tensor_filter: Optional[Callable[[str], bool]] = None,
         all_local: bool = False,
+        max_batch_bytes: Optional[int] = None,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -535,5 +594,6 @@ class ParallelLoader(PipelineParallel):
             queue_size,
             use_tqdm_on_load,
             tensor_filter=tensor_filter,
+            max_batch_bytes=max_batch_bytes,
             **kwargs,
         )

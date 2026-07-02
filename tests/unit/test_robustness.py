@@ -67,3 +67,26 @@ def test_odirect_env_override(monkeypatch):
     monkeypatch.setattr(unified, "get_fs_type", lambda p: "ext4")
     monkeypatch.setenv("FASTSAFETENSORS_ODIRECT", "0")
     assert unified._odirect_ok("/data/f") is False  # forced off
+
+
+# ---- chunk plans must fail loudly on copiers without set_chunk ----
+
+
+def test_chunk_plan_requires_set_chunk(input_files, framework):
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only")
+    from fastsafetensors import SafeTensorsFileLoader, SafeTensorsMetadata
+
+    loader = SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
+    loader.add_filenames({0: [input_files[0]]})
+    meta = SafeTensorsMetadata.from_file(input_files[0], framework)
+    (chunk,) = meta.plan_chunks(meta.size_bytes)  # single whole-span chunk
+    loader.set_chunk_plan({input_files[0]: chunk})
+
+    class _NoChunkCopier:  # e.g. gds/dstorage: no set_chunk support
+        def __init__(self, *a, **k):
+            pass
+
+    loader.copier_constructor = lambda m, d, f: _NoChunkCopier()
+    with pytest.raises(NotImplementedError, match="set_chunk"):
+        loader.copy_files_to_device()
