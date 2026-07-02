@@ -515,6 +515,71 @@ class SafeTensorsMetadata:
             chunks.append((set(cur), [(s0, e0) for s0, e0 in cur_runs]))
         return chunks
 
+    def with_slices(
+        self,
+        slice_spec: Callable[[str], Optional[Tuple[int, int, int]]],
+    ) -> "SafeTensorsMetadata":
+        """Derived metadata narrowing sharded tensors to this rank's rows.
+
+        ``slice_spec(name)`` returns ``(dim, rank, world_size)`` for tensors
+        sharded across ranks, or ``None`` for replicated ones. Tensors sharded
+        on dim 0 occupy a contiguous byte range per rank (row-major layout), so
+        their frames are rewritten to that range with ``shape[0]`` narrowed --
+        every downstream consumer (byte-range selection, chunk planning,
+        copiers, tensor materialization) is offset-driven and then reads and
+        materializes only this rank's shard. Rows split as ``rows // world``
+        per rank with the remainder going to the lowest ranks.
+
+        Tensors that cannot be narrowed at read time (``dim != 0``, fewer rows
+        than ranks, or rows not byte-addressable) keep their full frame; the
+        caller slices those after load. Requires per-rank reading (no
+        cross-rank broadcast), e.g. ``ParallelLoader(all_local=True)``.
+        """
+        import copy as _copy
+
+        tensors: OrderedDict[str, TensorFrame] = OrderedDict()
+        for name, frame in self.tensors.items():
+            spec = slice_spec(name)
+            if spec is None:
+                tensors[name] = frame
+                continue
+            dim, rank, world = spec
+            rows = frame.shape[0] if frame.shape else 0
+            nbytes = frame.data_offsets[1] - frame.data_offsets[0]
+            if (
+                dim != 0
+                or world <= 1
+                or rows < world
+                or nbytes % rows != 0  # rows not byte-addressable (packed dtypes)
+            ):
+                tensors[name] = frame
+                continue
+            row_bytes = nbytes // rows
+            base, rem = divmod(rows, world)
+            r0 = rank * base + min(rank, rem)
+            r1 = r0 + base + (1 if rank < rem else 0)
+            shape = [r1 - r0] + list(frame.shape[1:])
+            strides = []
+            for i in range(len(shape)):
+                s = 1
+                for j in range(i + 1, len(shape)):
+                    s *= shape[j]
+                strides.append(s)
+            tensors[name] = TensorFrame(
+                frame.dtype,
+                shape,
+                [
+                    frame.data_offsets[0] + r0 * row_bytes,
+                    frame.data_offsets[0] + r1 * row_bytes,
+                ],
+                strides,
+                [0] * len(shape),
+                False,
+            )
+        derived = _copy.copy(self)
+        derived.tensors = tensors
+        return derived
+
     def __repr__(self) -> str:
         return str({"__metadata__": self.metadata, "tensors": self.tensors})
 
