@@ -76,6 +76,9 @@ class BaseSafeTensorsFileLoader:
         self.frames = OrderedDict[str, TensorFrame]()
         self.disable_cache = disable_cache
         self._tensor_filter: Optional[Callable[[str], bool]] = None
+        self._tensor_slices: Optional[
+            Callable[[str], Optional[Tuple[int, int, int]]]
+        ] = None
         # realpath -> (chunk tensor names, byte-ranges) for the next
         # copy_files_to_device; set by PipelineParallel when max_batch_bytes is
         # active so each file loads only a sub-file chunk. Empty = whole files.
@@ -95,6 +98,21 @@ class BaseSafeTensorsFileLoader:
             if node is not None:
                 fstcpp.set_numa_node(node)
             gl_set_numa = True
+
+    def set_tensor_slices(
+        self, slice_spec: Optional[Callable[[str], Optional[Tuple[int, int, int]]]]
+    ) -> None:
+        """Read only this rank's shard of sharded tensors.
+
+        ``slice_spec(name)`` returns ``(dim, rank, world_size)`` or ``None``
+        (replicated). Dim-0 shards are narrowed at read time (contiguous byte
+        range; see ``SafeTensorsMetadata.with_slices``); others load in full
+        for the caller to slice. ``get_keys``/``get_shape`` and yielded tensors
+        reflect the narrowed shapes. Requires per-rank reading (single-process
+        loader group / all_local): a cross-rank broadcast would send one rank's
+        shard to ranks that need a different one.
+        """
+        self._tensor_slices = slice_spec
 
     def set_chunk_plan(
         self, chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]]
@@ -153,6 +171,8 @@ class BaseSafeTensorsFileLoader:
                 if next_idx < len(filenames[rank]):
                     realpath = filenames[rank][next_idx]  # os.path.realpath(filename)
                     metadata = SafeTensorsMetadata.from_file(realpath, self.framework)
+                    if self._tensor_slices is not None:
+                        metadata = metadata.with_slices(self._tensor_slices)
                     self.meta[realpath] = (metadata, rank)
                     self.frames.update(metadata.tensors)
                     if rank == self.pg.rank():
