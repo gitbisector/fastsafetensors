@@ -146,6 +146,7 @@ class PipelineParallel:
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
         resident_tensor: Optional[Callable[[str], bool]] = None,
+        tensor_slices: Optional[Callable[[str], Optional[Tuple[int, int, int]]]] = None,
         **kwargs,
     ):
 
@@ -171,6 +172,19 @@ class PipelineParallel:
                     "tensors this rank never read"
                 )
             loader.set_tensor_filter(tensor_filter)
+        # Read only this rank's shard of dim-0-sharded tensors (see
+        # SafeTensorsMetadata.with_slices). Each rank must read its own bytes,
+        # so this requires a single-process loader group (all_local=True):
+        # a broadcast would deliver one rank's shard to every rank.
+        if tensor_slices is not None:
+            if pg.size() > 1:
+                raise ValueError(
+                    "tensor_slices requires a single-process loader group "
+                    "(all_local=True or pg=None); a cross-rank broadcast "
+                    "cannot deliver per-rank shards"
+                )
+            loader.set_tensor_slices(tensor_slices)
+        self._tensor_slices = tensor_slices
         self.hf_weights_files = hf_weights_files
         self.max_concurrent_producers = max_concurrent_producers
         self.queue_size = queue_size
@@ -277,9 +291,17 @@ class PipelineParallel:
         keep = self.loader._tensor_filter
         fw = self.loader.framework
 
+        def _read_meta(f: str) -> SafeTensorsMetadata:
+            # Must mirror the loader's add_filenames narrowing so chunk plans
+            # (names + byte ranges) match the metadata the copiers will see.
+            meta = SafeTensorsMetadata.from_file(f, fw)
+            if self._tensor_slices is not None:
+                meta = meta.with_slices(self._tensor_slices)
+            return meta
+
         # Parse each distinct shard once for planning and all later chunks.
         meta_by_path = {
-            f: SafeTensorsMetadata.from_file(f, fw)
+            f: _read_meta(f)
             for f in dict.fromkeys(self.hf_weights_files)
         }
 
@@ -801,6 +823,7 @@ class ParallelLoader(PipelineParallel):
         accumulate_resident: bool = True,
         resident_tensor: Optional[Callable[[str], bool]] = None,
         use_fgds: bool = False,
+        tensor_slices: Optional[Callable[[str], Optional[Tuple[int, int, int]]]] = None,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -851,5 +874,6 @@ class ParallelLoader(PipelineParallel):
             device_memory_budget=device_memory_budget,
             accumulate_resident=accumulate_resident,
             resident_tensor=resident_tensor,
+            tensor_slices=tensor_slices,
             **kwargs,
         )
