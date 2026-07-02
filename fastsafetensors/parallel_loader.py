@@ -135,11 +135,14 @@ class PipelineParallel:
         # queue_size semantics:
         #   -1 : fully serial — copy_files → broadcast → copy_files (1 batch in GPU mem)
         #    0 : unbuffered pipeline — 1 copying + 1 broadcasting concurrently (2 batches)
-        #   >0 : buffered pipeline — up to (queue_size+1) batches in GPU mem
+        #   >0 : buffered pipeline — up to (queue_size+2) batches in GPU mem
+        #        (queue_size queued + 1 being produced + 1 being consumed)
         queue_size: int = 0,
         use_tqdm_on_load: bool = True,
         tensor_filter: Optional[Callable[[str], bool]] = None,
         max_batch_bytes: Optional[int] = None,
+        device_memory_budget: Optional[Union[int, str]] = None,
+        accumulate_resident: bool = True,
         **kwargs,
     ):
 
@@ -173,8 +176,20 @@ class PipelineParallel:
         # bytes) so peak device buffer per rank is bounded regardless of shard
         # size. See SafeTensorsMetadata.plan_chunks / CopierInterface.set_chunk.
         self.max_batch_bytes = max_batch_bytes
+        # When set, bound the load's TOTAL device footprint (resident tensors
+        # + transient buffers) via a static fit plan: whole-file loads while
+        # headroom is ample, per-file chunk budgets declining as the device
+        # fills. int = bytes; "auto" = free memory minus a reserve, queried
+        # once at plan time. See fastsafetensors.planner.
+        self.device_memory_budget = device_memory_budget
+        # True: the consumer keeps every yielded tensor (resident grows by
+        # cumulative kept bytes). False: tensors are copied into preallocated
+        # destinations (e.g. model params) so resident growth is 0 and the fit
+        # plan degenerates to a uniform per-file budget.
+        self.accumulate_resident = accumulate_resident
 
-        # Batch files (or, with max_batch_bytes, sub-file chunk-batches)
+        # Batch files (or, with max_batch_bytes / device_memory_budget,
+        # sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
 
         # Producer-consumer communication
@@ -221,28 +236,86 @@ class PipelineParallel:
             self.hf_weights_files[i : i + batch_size]
             for i in range(0, len(self.hf_weights_files), batch_size)
         ]
-        if self.max_batch_bytes is None:
+        if self.max_batch_bytes is None and self.device_memory_budget is None:
             return file_batches
-        # Sub-file chunking: expand each file-batch (one file per rank) into
-        # aligned chunk-batches. Chunk-batch j holds rank r's j-th chunk (or
-        # None once that rank's file runs out), so every rank issues the same
-        # broadcast sequence in lockstep. Header reads are deterministic, so all
-        # ranks build identical batches. Each shard stays owned by one rank and
-        # is loaded in chunks over successive batches -> peak buffer bounded by
-        # max_batch_bytes per rank.
+
         keep = self.loader._tensor_filter
         fw = self.loader.framework
+
+        # Per-file chunk budget. Uniform (max_batch_bytes) by default; with
+        # device_memory_budget, a static fit plan chooses declining budgets so
+        # resident + transient stays within the budget (see planner module).
+        per_file_budget: Optional[Dict[str, int]] = None
+        meta_by_path: Dict[str, SafeTensorsMetadata] = {}
+        if self.device_memory_budget is not None:
+            from .planner import (
+                collect_file_stats,
+                pipeline_depth,
+                plan_file_budgets,
+                resolve_auto_budget,
+            )
+
+            if isinstance(self.device_memory_budget, str):
+                if self.device_memory_budget != "auto":
+                    raise ValueError(
+                        f"device_memory_budget must be an int or 'auto', got "
+                        f"{self.device_memory_budget!r}"
+                    )
+                if batch_size > 1:
+                    # Per-rank free-memory readings diverge, which would give
+                    # ranks different plans and deadlock the lockstep broadcast
+                    # sequence. The caller owns the process group: min-reduce
+                    # free memory across ranks and pass the explicit result.
+                    raise NotImplementedError(
+                        'device_memory_budget="auto" requires a single-process '
+                        "loader group (all_local=True or pg=None); with "
+                        "broadcast loading, all-reduce(MIN) the free memory "
+                        "yourself and pass an explicit integer budget"
+                    )
+                budget = resolve_auto_budget(fw.get_mem_free(self.loader.device))
+            else:
+                budget = self.device_memory_budget
+            metas = [
+                (f, SafeTensorsMetadata.from_file(f, fw)) for f in self.hf_weights_files
+            ]
+            # Broadcast mode adds one in-flight receive tensor (<= one chunk
+            # budget) on top of the live gbufs; an explicit identical budget on
+            # every rank keeps the plan deterministic across ranks.
+            depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
+            # The mmap+pin fallback pins each chunk's pages alongside the
+            # device buffer; on unified memory both draw from one pool, so the
+            # planner must charge those chunks at 2x span (measured on GB10:
+            # the O_DIRECT path stays ~1x + fixed pool).
+            from .copier.unified import chunk_transient_multiplier
+
+            budgets = plan_file_budgets(
+                collect_file_stats(metas, keep),
+                budget,
+                depth,
+                max_batch_bytes=self.max_batch_bytes,
+                accumulate_resident=self.accumulate_resident,
+                transient_multiplier=chunk_transient_multiplier([f for f, _ in metas]),
+            )
+            per_file_budget = {f: b for (f, _), b in zip(metas, budgets)}
+            meta_by_path = dict(metas)
+
+        # Expand each file-batch (one file per rank) into aligned chunk-batches.
+        # Chunk-batch j holds rank r's j-th chunk (or None once that rank's file
+        # runs out), so every rank issues the same broadcast sequence in
+        # lockstep. Header reads are deterministic, so all ranks build identical
+        # batches. Each shard stays owned by one rank and is loaded in chunks
+        # over successive batches -> peak buffer bounded by its budget per rank.
+        def _plan_file(f: str) -> List[Tuple[Set[str], List[Tuple[int, int]]]]:
+            if per_file_budget is not None:
+                return meta_by_path[f].plan_chunks(per_file_budget[f], keep_tensor=keep)
+            assert self.max_batch_bytes is not None
+            return SafeTensorsMetadata.from_file(f, fw).plan_chunks(
+                self.max_batch_bytes, keep_tensor=keep
+            )
+
         chunk_batches: List[List[Any]] = []
         for group in file_batches:
-            planned = [
-                (
-                    f,
-                    SafeTensorsMetadata.from_file(f, fw).plan_chunks(
-                        self.max_batch_bytes, keep_tensor=keep
-                    ),
-                )
-                for f in group
-            ]
+            planned = [(f, _plan_file(f)) for f in group]
             maxn = max((len(chunks) for _, chunks in planned), default=0)
             for j in range(maxn):
                 spec: List[Any] = []
@@ -270,11 +343,12 @@ class PipelineParallel:
     def _spec_to_maps(self, spec: List[Any]):
         """Turn a batch spec into (rank_file_map, chunk_plan).
 
-        Without max_batch_bytes the spec is a list of files (one per rank). With
-        it, the spec is a chunk-batch: per rank, either (file, names, ranges) or
-        None (that rank has no chunk this batch).
+        Without sub-file chunking (neither max_batch_bytes nor
+        device_memory_budget set) the spec is a list of files (one per rank).
+        With it, the spec is a chunk-batch: per rank, either
+        (file, names, ranges) or None (that rank has no chunk this batch).
         """
-        if self.max_batch_bytes is None:
+        if self.max_batch_bytes is None and self.device_memory_budget is None:
             return {i: [f] for i, f in enumerate(spec)}, None
         rank_file_map: Dict[int, List[str]] = {}
         chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
@@ -551,6 +625,8 @@ class ParallelLoader(PipelineParallel):
         tensor_filter: Optional[Callable[[str], bool]] = None,
         all_local: bool = False,
         max_batch_bytes: Optional[int] = None,
+        device_memory_budget: Optional[Union[int, str]] = None,
+        accumulate_resident: bool = True,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -595,5 +671,7 @@ class ParallelLoader(PipelineParallel):
             use_tqdm_on_load,
             tensor_filter=tensor_filter,
             max_batch_bytes=max_batch_bytes,
+            device_memory_budget=device_memory_budget,
+            accumulate_resident=accumulate_resident,
             **kwargs,
         )

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 try:
     import torch
     import torch.distributed as dist
@@ -404,6 +406,15 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
             return torch.cuda.get_device_name(index)
         except Exception:
             return ""
+
+    def get_mem_free(self, dev: Device) -> int:
+        if dev.type == DeviceType.CPU:
+            # Best effort: available physical pages (Linux/macOS).
+            return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        free, _total = torch.cuda.mem_get_info(
+            dev.index if dev.index is not None else 0
+        )
+        return int(free)
 
     def mmap_file_pinned(self, filename: str, length: int, offset: int) -> TorchTensor:
         # mmap the file lazily; pin_memory then faults in and pins the pages

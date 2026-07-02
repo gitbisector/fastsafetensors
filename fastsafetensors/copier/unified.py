@@ -228,6 +228,26 @@ def is_unified_memory_system(framework: Optional[FrameworkOpBase] = None) -> boo
     return "gb10" in framework.get_device_name(0).lower()
 
 
+def chunk_transient_multiplier(paths: List[str]) -> int:
+    """Per in-flight-buffer transient cost multiplier for chunked loads.
+
+    The O_DIRECT reader (dma_load_runs) reads runs straight into the device
+    buffer: each live chunk costs ~1x its span plus a small fixed thread pool
+    (measured +~150 MB on GB10 regardless of chunk size; the auto-budget
+    reserve absorbs it). The mmap+pin_memory fallback additionally pins the
+    chunk's file pages for the copy's lifetime; on unified-memory systems both
+    draws come from one physical pool, so each live chunk costs ~2x its span.
+    Mirrors submit_io's own path selection.
+    """
+    if getattr(fstcpp, "dma_load_runs", None) is None:
+        return 2
+    if int(os.environ.get("FASTSAFETENSORS_DMA_THREADS", "8")) <= 0:
+        return 2
+    if any(not _odirect_ok(p) for p in paths):
+        return 2
+    return 1
+
+
 @register_copier_constructor("unified")
 def new_unified_copier(device: Device, **kwargs) -> CopierConstructFunc:
     """Factory function for UnifiedMemCopier.

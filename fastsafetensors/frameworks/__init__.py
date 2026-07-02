@@ -222,6 +222,17 @@ class FrameworkOpBase(ABC, Generic[T, K]):
         """
         return ""
 
+    def get_mem_free(self, dev: Device) -> int:
+        """Return the free memory in bytes on *dev* right now. Used by the
+        fit planner's "auto" budget (one query at plan time). Frameworks
+        without a free-memory query keep the default and require an explicit
+        integer ``device_memory_budget`` instead.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_mem_free(); "
+            "pass an explicit integer device_memory_budget"
+        )
+
     def mmap_file_pinned(self, filename: str, length: int, offset: int) -> TensorBase:
         """Return a pinned CPU byte tensor holding the file content at
         ``[offset, offset + length)``.  The returned tensor owns the pinned

@@ -3,7 +3,7 @@
 import json
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from .common import init_logger
 
@@ -37,6 +37,13 @@ class LoaderConfig:
     # chunks (load -> [broadcast] -> release). None keeps whole-shard loading.
     # Must be >= the largest single tensor. See SafeTensorsMetadata.plan_chunks.
     max_batch_bytes: Optional[int] = None
+
+    # Bound the load's total device footprint (resident tensors + transient
+    # buffers) per rank via a static fit plan: whole-file loads while headroom
+    # is ample, chunking only where the fit requires it. int = bytes; "auto" =
+    # free device memory minus a reserve, queried once at plan time. Requires
+    # a single-process loader group. See fastsafetensors.planner.
+    device_memory_budget: Optional[Union[int, str]] = None
 
     _extensions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -109,14 +116,20 @@ class LoaderConfig:
         return cls._from_json(path)
 
     def create_parallel_kwargs(self) -> Dict[str, Any]:
+        # Memory knobs apply with or without pipelining.
+        common: Dict[str, Any] = {
+            "max_batch_bytes": self.max_batch_bytes,
+            "device_memory_budget": self.device_memory_budget,
+        }
         if not self.use_pipeline:
             # queue_size=-1: fully serial (copy_files → broadcast → copy_files),
             # only 1 batch in GPU memory at a time.
-            return {"queue_size": -1}
+            return {"queue_size": -1, **common}
         return {
             "max_concurrent_producers": self.max_concurrent_producers,
             "queue_size": self.queue_size,
             "use_tqdm_on_load": self.use_tqdm_on_load,
+            **common,
         }
 
 

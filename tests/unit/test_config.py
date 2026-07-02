@@ -365,6 +365,7 @@ class TestLoaderConfigKwargsHelpers:
             "queue_size": 2,
             "use_tqdm_on_load": False,
             "max_batch_bytes": None,
+            "device_memory_budget": None,
         }
 
     def test_create_parallel_kwargs_pipeline_disabled(self):
@@ -378,6 +379,7 @@ class TestLoaderConfigKwargsHelpers:
         assert kwargs == {
             "queue_size": -1,
             "max_batch_bytes": None,
+            "device_memory_budget": None,
         }
 
     def test_max_concurrent_producers_validation(self):
