@@ -38,10 +38,24 @@ load_library_functions(resolve_runtime_lib_name())
 FRAMEWORK = get_framework_op(os.getenv("TEST_FASTSAFETENSORS_FRAMEWORK", "please set"))
 
 
+def using_mock_reader() -> bool:
+    """True when the 3FS reader is the CI mock rather than the real package."""
+    try:
+        import fastsafetensor_3fs_reader as reader
+    except ImportError:
+        return True
+    return getattr(reader, "ThreeFSFileReader", None) is MockFileReader
+
+
 def get_device(framework: FrameworkOpBase):
     dev_is_gpu = is_gpu_found()
     device = "cpu"
-    if dev_is_gpu:
+    # MockFileReader copies into dev_ptr with ctypes.memmove, which requires
+    # host memory -- handing it a device pointer segfaults the interpreter.
+    # Only the real 3FS reader can DMA into device memory, so stay on the CPU
+    # whenever the mock is standing in. CI has no GPU, which is why this only
+    # ever bit people running the suite on a GPU host.
+    if dev_is_gpu and not using_mock_reader():
         if framework.get_name() == "pytorch":
             device = "cuda:0"
         elif framework.get_name() == "paddle":
