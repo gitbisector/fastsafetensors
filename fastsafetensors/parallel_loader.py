@@ -20,8 +20,10 @@ except ImportError:
 from . import cpp as fstcpp
 from ._planner import plan_chunks
 from .common import SafeTensorsMetadata, SingleGroup
+from .copier import SharedHostCopier
 from .frameworks import FrameworkOpBase
 from .loader import BaseSafeTensorsFileLoader, SafeTensorsFileLoader
+from .shared_host import SharedHostRing
 
 
 def enable_tqdm(
@@ -144,6 +146,10 @@ class PipelineParallel:
         max_batch_bytes: Optional[int] = None,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
+        shared_host: bool = False,
+        shared_host_dir: str = "/dev/shm",
+        shared_host_tag: str = "fst_shared",
+        barrier: Optional[Callable[[], None]] = None,
         **kwargs,
     ):
 
@@ -166,7 +172,10 @@ class PipelineParallel:
                     "tensor_filter requires a single-process loader group "
                     "(ParallelLoader(all_local=True) or pg=None): get_tensor "
                     "broadcasts across the loader group, which would deliver "
-                    "tensors this rank never read"
+                    "tensors this rank never read. It is also rejected with "
+                    "shared_host=True, where one rank stages a shard for the "
+                    "whole node: the ranges it publishes are the ones ITS "
+                    "filter kept, which need not cover what its peers want."
                 )
             loader.set_tensor_filter(tensor_filter)
         self.hf_weights_files = hf_weights_files
@@ -191,9 +200,43 @@ class PipelineParallel:
         # plan degenerates to a uniform per-file budget.
         self.accumulate_resident = accumulate_resident
 
+        # Shared-host staging: co-located ranks publish their shard of each
+        # batch into a host ring every rank maps, so delivery is a host->device
+        # copy on each rank instead of a cross-rank broadcast. The READ plan is
+        # unchanged -- _create_batches still gives each rank one file per batch,
+        # and each byte still leaves storage exactly once. Only delivery moves.
+        # Degenerate at size 1 (nothing to redistribute) and with nothing to
+        # load, so in both cases it turns itself off.
+        self.shared_host = (
+            bool(shared_host) and pg.size() > 1 and bool(hf_weights_files)
+        )
+        self._barrier_fn: Optional[Callable[[], None]] = None
+        self._ring: Optional[SharedHostRing] = None
+        if self.shared_host:
+            if barrier is not None:
+                self._barrier_fn = barrier
+            else:
+                # The pg abstraction gained barrier() for exactly this; groups
+                # that do not implement it raise and the caller injects one.
+                self._barrier_fn = loader.framework.get_process_group(pg).barrier
+
         # Batch files (or, with max_batch_bytes / device_memory_budget,
         # sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
+
+        if self.shared_host:
+            # One slot per rank, each sized for the largest shard: publish()
+            # writes at absolute file offsets, so even a tail chunk of a file
+            # needs the file's full extent addressable.
+            slot_bytes = max(os.path.getsize(f) for f in self.hf_weights_files)
+            self._ring = SharedHostRing(
+                slot_bytes,
+                pg.size(),
+                pg.rank(),
+                barrier=self._barrier_fn,
+                directory=shared_host_dir,
+                tag=shared_host_tag,
+            )
 
         # Producer-consumer communication
         # For unbuffered behavior (queue_size=0), we use a maxsize of 1 to ensure synchronization
@@ -215,9 +258,13 @@ class PipelineParallel:
         # Logging setup - get from environment variable, default to False
         self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
         self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
-        # When pg.size() == 1, tensors reference the underlying gbuf memory
-        # which will be freed in fb.close(). Clone to ensure data survives.
-        self.need_clone = pg.size() == 1 if pg is not None else True
+        # When the loader's group has size 1, tensors reference the underlying
+        # gbuf memory which will be freed in fb.close(). Clone to ensure data
+        # survives. Under shared-host staging the loader group is single-process
+        # however wide the batch group is, so it always clones.
+        self.need_clone = (
+            pg.size() == 1 if pg is not None else True
+        ) or self.shared_host
 
         fstcpp.set_gil_release(True)
 
@@ -266,11 +313,17 @@ class PipelineParallel:
             # batch_size also sets the group width: those files load together,
             # one per rank, and every rank keeps all of them.
             depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
+            if self.shared_host:
+                # No broadcast receive tensor, but every rank now materializes
+                # the whole group itself: batch_size chunk buffers are live per
+                # in-flight batch instead of one. (The host ring is host memory
+                # and is NOT charged here -- see the ParallelLoader docstring.)
+                depth = pipeline_depth(self.queue_size) * batch_size
             # How much transient device memory a live chunk costs is the
             # copier's own business (e.g. the unified copier's mmap+pin
             # fallback pins the chunk's pages alongside the device buffer,
             # costing 2x span on a shared physical pool), so ask it.
-            copier = self.loader.copier_class
+            copier = SharedHostCopier if self.shared_host else self.loader.copier_class
             multiplier = copier.chunk_transient_multiplier([f for f, _ in metas])
             budgets = plan_file_budgets(
                 collect_file_stats(metas, keep),
@@ -388,6 +441,44 @@ class PipelineParallel:
             chunk_plan[f] = (names, ranges)
         return rank_file_map, chunk_plan
 
+    def _publish_batch(
+        self,
+        owners: Dict[int, List[str]],
+        chunk_plan: Optional[Dict[str, Tuple[Set[str], List[Tuple[int, int]]]]],
+    ) -> None:
+        """Stage this batch through the host ring instead of broadcasting it.
+
+        Each rank reads the one file it owns -- the same file it would have read
+        anyway -- into its own slot, and every rank then copies all of the
+        batch's files out of the ring. Only the ranges the copiers will actually
+        read are staged, so a chunk plan narrows the staging too.
+        """
+        assert self._ring is not None and self._barrier_fn is not None
+        size = self._ring.size
+        batch: List[Optional[str]] = [None] * size
+        ranges: List[List[Tuple[int, int]]] = [[] for _ in range(size)]
+        staged: Dict[str, int] = {}
+        for rank, files in owners.items():
+            path = files[0]
+            meta, _ = self.loader.meta[path]
+            batch[rank] = path
+            if chunk_plan is not None:
+                # Exactly the runs this batch's copiers will read.
+                ranges[rank] = list(chunk_plan[path][1])
+            else:
+                # Whole data section; the header is never read from the ring
+                # (metadata comes from the file itself, on every rank).
+                ranges[rank] = [(meta.header_length, meta.size_bytes)]
+            staged[path] = self._ring.slot_address(rank)
+        # Guard the PREVIOUS batch's readers: this rank is about to overwrite
+        # its slot and a peer may still be copying out of it. Every rank's
+        # copy_files_to_device runs to completion inside _load_single_batch, so
+        # arriving here means every rank has finished the previous batch.
+        # publish() barriers on the way out, which is what publishes the bytes.
+        self._barrier_fn()
+        self._ring.publish(batch, ranges=ranges)
+        self.loader._set_staged_sources(staged)
+
     def _load_single_batch(self, batch_id: int, file_list: List[Any]):
         """Load a single batch into device memory.
 
@@ -413,11 +504,22 @@ class PipelineParallel:
 
         try:
             rank_file_map, chunk_plan = self._spec_to_maps(file_list)
+            owners: Optional[Dict[int, List[str]]] = None
+            if self.shared_host:
+                # Ownership (who reads what) stays as planned; delivery changes.
+                # Every rank builds every file of the batch out of the ring, so
+                # for the loader's single-process group they are all local.
+                owners = rank_file_map
+                rank_file_map = {
+                    0: [f for r in sorted(owners) for f in owners[r]],
+                }
 
             with TimingContext("add_filenames", self._log_message, batch_id) as timer:
                 self.loader.add_filenames(rank_file_map)
                 if chunk_plan is not None:
                     self.loader._set_chunk_plan(chunk_plan)
+                if owners is not None:
+                    self._publish_batch(owners, chunk_plan)
             add_filenames_time = timer.elapsed_ms
 
             # For unbuffered behavior, wait for consumer to process previous item
@@ -597,6 +699,9 @@ class PipelineParallel:
             self._drain_queue()
 
     def close(self):
+        if self._ring is not None:
+            self._ring.close()
+            self._ring = None
         self.loader.close()
 
 
@@ -635,6 +740,30 @@ class ParallelLoader(PipelineParallel):
                          broadcast (e.g. expert-parallel slicing). The EP
                          rank/size for the filter come from the real
                          distributed world, independent of the loader's group.
+        shared_host (bool): If True, deliver each batch through a host ring
+                         shared by the group instead of broadcasting it. The
+                         read plan is unchanged -- each rank still reads one
+                         file per batch -- but instead of broadcasting its
+                         tensors it publishes the shard's bytes into a slot
+                         every rank maps, and every rank copies all of the
+                         batch's shards host->device itself. Requires all ranks
+                         of *pg* to be processes on ONE node with a common
+                         *shared_host_dir*; it is a no-op for a group of 1.
+                         Costs ``pg.size() x (largest shard bytes)`` of host
+                         memory in that directory for the whole load: that is
+                         NOT covered by device_memory_budget (it is not device
+                         memory), but the ring refuses to be built if the
+                         directory cannot hold it. Mutually exclusive with
+                         all_local, and not usable with tensor_filter.
+        shared_host_dir (str): Directory backing the ring (default /dev/shm).
+                         Must be a shared-memory filesystem visible to every
+                         rank on the node.
+        shared_host_tag (str): Basename of the ring's slot files. Give
+                         concurrent loads on one node distinct tags.
+        barrier (Optional[Callable[[], None]]): Group barrier used by
+                         shared_host staging. Defaults to the process group's
+                         own ``barrier()``; pass one explicitly for groups that
+                         do not implement it.
 
     Additional GPU memory consumption: (max_concurrent_producers + queue_size) * file_size
     To reduce GPU memory consumption, re-accessing tensors that have already been accessed is prohibited.
@@ -666,6 +795,10 @@ class ParallelLoader(PipelineParallel):
         max_batch_bytes: Optional[int] = None,
         device_memory_budget: Optional[int] = None,
         accumulate_resident: bool = True,
+        shared_host: bool = False,
+        shared_host_dir: str = "/dev/shm",
+        shared_host_tag: str = "fst_shared",
+        barrier: Optional[Callable[[], None]] = None,
         **kwargs,
     ):
         """Initialize PipelineParallelLoader with a pre-configured SafeTensorsFileLoader.
@@ -688,7 +821,16 @@ class ParallelLoader(PipelineParallel):
         # files independently (no cross-rank broadcast in get_tensor). This is
         # what makes a per-rank tensor_filter correct -- otherwise get_tensor
         # would broadcast tensors this rank never read.
-        loader_pg = SingleGroup() if all_local else pg
+        if shared_host and all_local:
+            raise ValueError(
+                "shared_host and all_local are alternatives: all_local has "
+                "every rank read every file, which leaves nothing to stage."
+            )
+        # shared_host also loads through a single-process group -- delivery is
+        # a copy out of the ring, not a broadcast -- but unlike all_local the
+        # batch plan keeps its full width, so each file is still read once by
+        # its owning rank.
+        loader_pg = SingleGroup() if (all_local or shared_host) else pg
         loader = SafeTensorsFileLoader(
             loader_pg,
             device,
@@ -701,8 +843,10 @@ class ParallelLoader(PipelineParallel):
             framework=framework,
             **kwargs,
         )
+        # The batch plan is built from the REAL group under shared_host: the
+        # files of a batch are read one per rank, exactly as under broadcast.
         super().__init__(
-            loader_pg,
+            pg if shared_host else loader_pg,
             loader,
             hf_weights_files,
             max_concurrent_producers,
@@ -712,5 +856,9 @@ class ParallelLoader(PipelineParallel):
             max_batch_bytes=max_batch_bytes,
             device_memory_budget=device_memory_budget,
             accumulate_resident=accumulate_resident,
+            shared_host=shared_host,
+            shared_host_dir=shared_host_dir,
+            shared_host_tag=shared_host_tag,
+            barrier=barrier,
             **kwargs,
         )

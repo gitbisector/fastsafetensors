@@ -77,6 +77,18 @@ class ProcessGroupBase(ABC, Generic[T]):
     def broadcast(self, dst: T, rank: int) -> None:
         pass
 
+    def barrier(self) -> None:
+        """Block until every rank of this group has called it.
+
+        Deliberately not abstract: existing implementations predate it and only
+        shared-host staging needs it. A group that cannot barrier says so here
+        and the caller falls back to an injected barrier callable.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement barrier(); pass an "
+            f"explicit barrier callable instead"
+        )
+
     @abstractmethod
     def scatter(
         self,

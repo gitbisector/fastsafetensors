@@ -149,6 +149,10 @@ class TorchProcessGroup(ProcessGroupBase[TorchTensor]):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+    def barrier(self) -> None:
+        if self.real_pg:
+            dist.barrier(group=self.real_pg)
+
     def scatter(
         self,
         dst: TorchTensor,

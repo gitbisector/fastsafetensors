@@ -34,12 +34,16 @@ A staging primitive, not a new reader and not a new read plan:
     ring = SharedHostRing(slot_bytes, size, rank, barrier)   # one slot per rank
     ring.publish(paths_for_this_batch)             # each rank preads its own file
     for i, path in enumerate(batch):               # every rank now sees them all
-        view = ring.slot(i)
+        view = ring.slot(i)                        # or slot_address(i), to DMA
 
 It composes with, rather than replaces, the existing machinery: the read plan
 still comes from ``_create_batches``, byte-range selection still comes from
 ``tensor_filter``/``select_byte_ranges``, and chunking still comes from
 ``max_batch_bytes``/``device_memory_budget``.
+
+``ParallelLoader(shared_host=True)`` is the wiring: it publishes each batch here
+and builds every rank's frames out of the slots (see
+``fastsafetensors.copier.host_staged``).
 """
 
 import ctypes
@@ -48,7 +52,13 @@ import os
 import threading
 from typing import List, Optional, Sequence
 
-__all__ = ["SharedHostRing", "node_key", "shared_host_available"]
+__all__ = [
+    "SharedHostCapacityError",
+    "SharedHostRing",
+    "check_capacity",
+    "node_key",
+    "shared_host_available",
+]
 
 _DEFAULT_DIR = "/dev/shm"
 
@@ -70,6 +80,29 @@ def node_key() -> int:
 def shared_host_available(directory: str = _DEFAULT_DIR) -> bool:
     """True when ``directory`` is usable for cross-process shared mappings."""
     return os.path.isdir(directory) and os.access(directory, os.W_OK)
+
+
+class SharedHostCapacityError(ValueError):
+    """The ring does not fit in its backing directory."""
+
+
+def check_capacity(directory: str, total_bytes: int) -> None:
+    """Refuse a ring larger than ``directory`` can hold, at construction time.
+
+    ``truncate`` on a tmpfs reserves nothing -- pages are charged on first
+    write -- so a ring that overruns /dev/shm does not fail with an error, it
+    SIGBUSes the process mid-publish. Containers commonly cap /dev/shm at 64
+    MiB, so this is the normal failure, not an exotic one. Every rank computes
+    the same number against the same filesystem, so every rank refuses.
+    """
+    st = os.statvfs(directory)
+    free = st.f_bavail * st.f_frsize
+    if total_bytes > free:
+        raise SharedHostCapacityError(
+            f"shared-host ring needs {total_bytes} bytes in {directory}, which "
+            f"has {free} free. Enlarge it (e.g. docker --shm-size), point the "
+            f"ring elsewhere, or reduce the staged shard size."
+        )
 
 
 class SharedHostRing:
@@ -104,6 +137,7 @@ class SharedHostRing:
         self.slot_bytes = slot_bytes
         self.read_threads = read_threads
         self._paths = [os.path.join(directory, f"{tag}.{i}") for i in range(size)]
+        check_capacity(directory, slot_bytes * size)
         # The owner creates its own slot; a barrier makes them visible to all.
         with open(self._paths[self.rank], "wb") as f:
             f.truncate(slot_bytes)
@@ -202,6 +236,18 @@ class SharedHostRing:
         """
         return memoryview(self._mm[index])
 
+    def slot_address(self, index: int) -> int:
+        """Host address of byte 0 of rank ``index``'s slot.
+
+        For consumers that DMA out of the ring (``cudaMemcpyAsync`` and friends)
+        rather than walking a ``memoryview``; this is the address ``pin``
+        page-locks. Slot byte *F* is file byte *F*, so a copier can use the same
+        absolute offsets it would use against the file. Valid until ``close``.
+        """
+        # Deliberately not keeping the ctypes object: a live c_char keeps an
+        # exported pointer on the mmap and mmap.close() then raises BufferError.
+        return ctypes.addressof(ctypes.c_char.from_buffer(self._mm[index]))
+
     def _barrier(self) -> None:
         if self.size > 1 and self._barrier_fn is not None:
             self._barrier_fn()
@@ -240,17 +286,22 @@ def _pread_into(path: str, mm, spans, threads: int) -> None:
 # ---------------------------------------------------------------------------
 # RFC notes -- what this prototype deliberately does not do yet
 #
-# * The pg abstraction needs a barrier(). Staging needs exactly one collective and
-#   the framework process group exposes only broadcast/size/rank, so this takes an
-#   injected callable. Adding barrier() to ProcessGroupBase is part of the proposal.
-# * Delivery only. It stages bytes; it does not yet replace the broadcast inside
-#   ParallelLoader.iterate_weights(). Wiring it in means: where a batch is
-#   broadcast today, publish() instead and build each rank's frames against
-#   slot(i). The read plan (_create_batches) is unchanged.
-# * Budgeting. The fit planner charges DEVICE memory. Shared-host staging adds a
-#   host ring (size x slot_bytes) and, for consumers that stage to device, a
-#   device buffer. Both must be charged or the load can OOM mid-flight -- exactly
-#   what device_memory_budget exists to turn into a plan-time error.
+# * The pg abstraction needed a barrier(). Staging needs exactly one collective
+#   and the framework process group exposed only broadcast/size/rank, so this
+#   takes an injected callable. ProcessGroupBase.barrier() now exists as a
+#   non-abstract default, and ParallelLoader(shared_host=True) uses it unless the
+#   caller injects one.
+# * Delivery is wired: ParallelLoader(shared_host=True) publishes each batch and
+#   copies the frames out of slot_address(i) (copier/host_staged.py). The read
+#   plan (_create_batches) is unchanged. Still open: this ring is per-node only,
+#   and the caller must know its ranks are co-located -- node_key() is not yet
+#   checked across the group (no all-gather in the pg abstraction).
+# * Budgeting. The fit planner charges DEVICE memory: the batch's chunk buffers
+#   are charged (group_size of them are live per in-flight batch under staging).
+#   The host ring (size x slot_bytes) is NOT charged there -- it is a different
+#   pool -- so it is bounded instead by check_capacity() against the backing
+#   directory, which turns "does not fit" into a construction-time error rather
+#   than a SIGBUS mid-publish.
 # * Multi-node. node_key() gates it; the general shape is shared-host WITHIN a
 #   node and broadcast/allgather ACROSS nodes, which also fixes the multi-node
 #   case where every node currently re-reads the whole checkpoint.

@@ -112,6 +112,10 @@ class PaddleProcessGroup(ProcessGroupBase[PaddleTensor]):
             if paddle.device.is_compiled_with_cuda():
                 paddle.device.cuda.synchronize()
 
+    def barrier(self) -> None:
+        if self.real_pg:
+            pdist.barrier(group=self.real_pg)
+
     def scatter(
         self,
         dst: PaddleTensor,

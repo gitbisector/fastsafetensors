@@ -27,6 +27,7 @@ from .copier import (
     CopierConstructFunc,
     CopierInterface,
     CopierType,
+    SharedHostCopier,
     copier_class_of,
     create_copier_constructor,
 )
@@ -87,6 +88,10 @@ class BaseSafeTensorsFileLoader:
         # copy_files_to_device; set by PipelineParallel when max_batch_bytes is
         # active so each file loads only a sub-file chunk. Empty = whole files.
         self._chunk_plan: Dict[str, Tuple[Set[str], List[Tuple[int, int]]]] = {}
+        # realpath -> host address holding that file's bytes at matching offsets,
+        # staged by whichever rank read it (see _set_staged_sources). Empty =
+        # every file is read from storage by the configured copier.
+        self._staged_sources: Dict[str, int] = {}
         self.init_numa(set_numa)
         self.copier_constructor: CopierConstructFunc = create_copier_constructor(
             copier_type=copier_type,
@@ -120,10 +125,23 @@ class BaseSafeTensorsFileLoader:
         named tensors are registered. Used by max_batch_bytes batching."""
         self._chunk_plan = chunk_plan
 
+    def _set_staged_sources(self, staged: Dict[str, int]) -> None:
+        """Take the next copy's bytes from host memory, not from storage.
+
+        ``realpath -> host address`` of a buffer whose byte *F* is that file's
+        byte *F*, already populated (by this process or another one) for every
+        range the next ``copy_files_to_device`` will read. Those files are
+        copied by ``SharedHostCopier`` instead of the configured copier; every
+        other file is unaffected. Used by shared-host staging, where each rank
+        reads one shard from storage and publishes it for the whole node.
+        """
+        self._staged_sources = staged
+
     def reset(self):
         self.frames = {}
         self.meta = {}
         self._chunk_plan = {}
+        self._staged_sources = {}
 
     def close(self):
         self.reset()
@@ -203,8 +221,17 @@ class BaseSafeTensorsFileLoader:
         lidx = 1
         for realpath, (meta, rank) in sorted(self.meta.items(), key=lambda x: x[0]):
             self_rank = self.pg.rank() == rank
+            copier: Optional[CopierInterface]
             if self_rank:
-                copier = self.copier_constructor(meta, self.device, self.framework)
+                staged_addr = self._staged_sources.get(realpath)
+                if staged_addr is not None:
+                    # Bytes already in host memory: copy them out instead of
+                    # re-reading the file. Same metadata, same offsets.
+                    copier = SharedHostCopier(
+                        meta, self.device, self.framework, staged_addr
+                    )
+                else:
+                    copier = self.copier_constructor(meta, self.device, self.framework)
                 chunk = self._chunk_plan.get(realpath)
                 if chunk is not None:
                     # Copiers without partial-read support refuse the chunk
