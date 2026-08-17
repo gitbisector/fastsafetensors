@@ -217,6 +217,93 @@ def test_shared_host_is_a_noop_for_a_single_process(tmp_dir, framework):
     assert got == expected
 
 
+def _planner_worker(rank, size, files, barrier, tag, out, framework_name, budget):
+    """Record the depth the fit planner is charged, then load normally."""
+    try:
+        from fastsafetensors import _planner
+
+        real = _planner.plan_file_budgets
+        seen = []
+
+        def spy(stats, device_memory_budget, depth, **kw):
+            seen.append((depth, kw.get("group_size")))
+            return real(stats, device_memory_budget, depth, **kw)
+
+        _planner.plan_file_budgets = spy
+        try:
+            loader = ParallelLoader(
+                _FakeGroup(size, rank),
+                files,
+                device="cpu",
+                nogds=True,
+                framework=framework_name,
+                shared_host=True,
+                shared_host_tag=tag,
+                barrier=barrier.wait,
+                device_memory_budget=budget,
+                queue_size=0,
+            )
+        finally:
+            _planner.plan_file_budgets = real
+        try:
+            digests = {k: _tensor_digest(t) for k, t in loader.iterate_weights()}
+        finally:
+            loader.close()
+        out[rank] = {"seen": seen, "digests": digests}
+    except Exception:
+        out[rank] = f"ERROR {traceback.format_exc()}"
+
+
+def test_shared_host_charges_the_planner_for_the_whole_group(tmp_dir, framework):
+    """Staging holds group_size chunk buffers per batch, not one plus a receive.
+
+    Under broadcast the planner is charged pipeline_depth + 1 (the in-flight
+    receive tensor). Under staging every rank materializes the whole group
+    itself, so the charge is pipeline_depth x group_size -- and getting that
+    wrong is an OOM mid-load, which is exactly what a budget exists to prevent.
+    """
+    from fastsafetensors._planner import pipeline_depth
+
+    size = 2
+    files = _make_files(framework, tmp_dir, count=size)
+    expected = _reference(files, framework)
+
+    ctx = mp.get_context("fork")
+    barrier = ctx.Barrier(size)
+    mgr = ctx.Manager()
+    out = mgr.dict()
+    procs = [
+        ctx.Process(
+            target=_planner_worker,
+            args=(
+                r,
+                size,
+                files,
+                barrier,
+                _tag("planner"),
+                out,
+                framework.get_name(),
+                1 << 24,
+            ),
+        )
+        for r in range(size)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(timeout=120)
+        assert p.exitcode == 0, f"worker exited {p.exitcode}"
+
+    broadcast_depth = pipeline_depth(0) + 1
+    staged_depth = pipeline_depth(0) * size
+    assert staged_depth != broadcast_depth, "test cannot distinguish the two"
+    for rank in range(size):
+        got = out[rank]
+        assert isinstance(got, dict), f"rank {rank}: {got}"
+        assert got["seen"] == [(staged_depth, size)], f"rank {rank}: {got['seen']}"
+        assert got["digests"] == expected, f"rank {rank} delivered different bytes"
+
+
 def test_shared_host_with_no_files_builds_no_ring(framework):
     """Nothing to stage: no ring, and no crash sizing one from an empty list."""
     loader = ParallelLoader(
