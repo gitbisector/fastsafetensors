@@ -233,12 +233,32 @@ def plan_file_budgets(
             b = min(b, max_batch_bytes)
         if b < st.largest_tensor:
             required = resident + eff_depth * st.largest_tensor
+            hint = (
+                "Reduce pipeline depth (queue_size), free device memory, or pass "
+                "a larger explicit budget."
+            )
+            # Those remedies all act on the transient term. When the resident
+            # term is what sinks the plan, a caller following them tunes the
+            # wrong knob -- so name the assumption that produced it, but only
+            # once we know dropping it actually makes this file fit.
+            if accumulate_resident and resident > 0:
+                b_no_resident = device_memory_budget // eff_depth
+                if max_batch_bytes is not None:
+                    b_no_resident = min(b_no_resident, max_batch_bytes)
+                if b_no_resident >= st.largest_tensor:
+                    hint += (
+                        f" Note {resident} of those bytes is the resident term,"
+                        " charged because accumulate_resident=True assumes the"
+                        " consumer keeps every yielded tensor; this file fits with"
+                        " accumulate_resident=False. Pass it if the consumer copies"
+                        " each tensor into memory it allocated before the load and"
+                        " drops the original."
+                    )
             raise BudgetInfeasibleError(
                 f"Model does not fit device_memory_budget: loading '{st.path}' "
                 f"needs >= {required} bytes ({resident} resident + {eff_depth} x "
                 f"{st.largest_tensor} transient), budget is {device_memory_budget}. "
-                f"Reduce pipeline depth (queue_size), free device memory, or pass "
-                f"a larger explicit budget."
+                f"{hint}"
             )
         budgets.append(b)
     return budgets

@@ -440,3 +440,42 @@ def test_transient_multiplier_infeasible():
 def test_transient_multiplier_validation():
     with pytest.raises(ValueError):
         plan_file_budgets([_st("f0", GiB)], GiB, depth=1, transient_multiplier=0)
+
+
+def test_infeasible_points_at_accumulate_resident_when_that_is_the_cause():
+    # Resident is what sinks this plan: at f5 the cumulative kept bytes equal the
+    # whole budget, so no chunk size is left. The standing remedies all shrink the
+    # transient term, so a caller following them tunes the wrong knob.
+    stats = [_st(f"f{i}", 2 * GiB, largest=1 * GiB) for i in range(10)]
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        plan_file_budgets(stats, 12 * GiB, depth=2)
+    msg = str(ei.value)
+    assert "accumulate_resident=False" in msg, msg
+
+    # ...and the claim it makes must be true: the same plan fits with it off.
+    assert plan_file_budgets(stats, 12 * GiB, depth=2, accumulate_resident=False)
+
+
+def test_infeasible_stays_quiet_when_accumulate_resident_would_not_help():
+    # A single tensor larger than budget/depth cannot fit however resident is
+    # accounted, so the hint must NOT appear -- suggesting a knob that cannot fix
+    # the failure is worse than saying nothing.
+    stats = [_st("f0", 8 * GiB, largest=8 * GiB)]
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        plan_file_budgets(stats, 4 * GiB, depth=2)
+    assert "accumulate_resident" not in str(ei.value), str(ei.value)
+
+    # It is also silent when the caller already passed accumulate_resident=False.
+    with pytest.raises(BudgetInfeasibleError) as ei2:
+        plan_file_budgets(stats, 4 * GiB, depth=2, accumulate_resident=False)
+    assert "accumulate_resident" not in str(ei2.value), str(ei2.value)
+
+
+def test_infeasible_hint_respects_max_batch_bytes():
+    # max_batch_bytes, not resident, is the binding constraint here: dropping the
+    # resident charge still leaves chunks capped below the largest tensor, so the
+    # hint would be a false lead.
+    stats = [_st(f"f{i}", 2 * GiB, largest=1 * GiB) for i in range(10)]
+    with pytest.raises(BudgetInfeasibleError) as ei:
+        plan_file_budgets(stats, 12 * GiB, depth=2, max_batch_bytes=512 * MiB)
+    assert "accumulate_resident" not in str(ei.value), str(ei.value)
