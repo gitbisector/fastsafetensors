@@ -25,26 +25,42 @@ A 155.42 GiB checkpoint, TP=2, single node, one NVMe, two model-loading passes.
 Both arms are the same library build and read the same bytes -- no tensor_filter
 in either, since staging cannot take one (see the RFC notes):
 
-    delivery                       load     read from disk   effective
-    all_local (every rank reads)   89.8 s       606.3 GiB     6.77 GiB/s
-    shared-host staging            79.4 s       331.2 GiB     4.18 GiB/s
+    delivery                       load     read from disk   read rate
+    all_local (every rank reads)   89.8 s       606.3 GiB     6.90 GiB/s
+    shared-host staging            79.4 s       331.2 GiB     4.44 GiB/s
 
 Reads fall 1.83x, which is exactly the rank duplication this removes and is the
-proof the mechanism does what it claims. Wall clock falls only 1.13x, because at
-this point reads are no longer the bottleneck.
+proof the mechanism does what it claims. Delivery is byte-identical: hashing
+every loaded parameter gives the same digests under both modes, on both ranks.
 
-What the gap is: a consumer-side prototype that stages the same way but
-double-buffers -- reading the next shard while the current one DMAs -- reads
-essentially the same bytes (319.8 GiB) and finishes in 53.9 s, 1.47x faster than
-this wiring. The difference is not bytes, it is overlap: _publish_batch barriers,
-then every rank copies, then the next read starts, so disk and H2D never run at
-the same time. Fixing that is the next thing worth doing here, and it is worth
-more than the byte saving already banked.
+Wall clock falls only 1.13x, though, and the reason is a defect in THIS code, not
+a limit of the idea. A consumer-side prototype that stages the same way reads
+essentially the same bytes (319.8 GiB) in 53.9 s -- 1.47x faster -- so the gap is
+not bytes.
 
-(An earlier version of this file claimed ~23 s for shared-host staging. That was
-a consumer-side prototype figure measured in a different regime -- one pass, with
-a name filter that skipped the checkpoint's MTP layers -- and it is NOT what this
-wiring delivers. It is superseded by the table above.)
+It is read RATE. Sampling the device every 0.5 s across the load:
+
+    arm                windows >=6 GB/s   3-6 GB/s   idle   mean
+    all_local                      85%         10%     3%   6.90 GiB/s
+    shared-host staging            23%         59%     9%   4.44 GiB/s
+    prototype                      85%          2%    10%   6.36 GiB/s
+
+The disk is BUSY under staging (91% of windows), just persistently at about half
+speed. This NVMe is concurrency-limited -- 1.96 GB/s to one reader, 9.18 GB/s to
+eight -- so a sustained half-rate read means it is being given too few
+independent streams, which is the same failure that makes broadcast slow. Under
+staging each rank preads one file and publish() barriers before the next batch,
+so there is exactly one batch in flight and no read-ahead.
+
+Which factor dominates -- the missing read-ahead, or _pread_into's Python
+per-chunk copy into the mapping -- is NOT yet isolated, and the fix should not be
+guessed at before it is.
+
+(Two claims that used to live here are wrong and are kept only so they are not
+re-derived: "~23 s" was a prototype figure from a different regime -- one pass,
+with a name filter -- and never measured this code; and the gap was first
+explained as reads and H2D failing to overlap, which the duty-cycle sampling
+above refutes. The disk does not go idle.)
 
 What this adds
 --------------
@@ -324,9 +340,12 @@ def _pread_into(path: str, mm, spans, threads: int) -> None:
 #   staging is: with the filter the same load takes 32.1 s, against 79.4 s staged
 #   without it. So filter support is a prerequisite for adoption, not a
 #   refinement -- as it stands a consumer must choose between the two wins.
-# * Overlap. Reads and H2D are serialized by the publish barrier; see the
-#   measured table above. Double-buffering the ring (publish batch n+1 while the
-#   copies for batch n drain) is the single biggest remaining win.
+# * Read concurrency. The measured gap above is a read-RATE gap: staging sustains
+#   4.44 GiB/s against 6.90 for all_local, with the device busy the whole time.
+#   One batch is in flight and each rank preads a single file, so the drive sees
+#   too few streams. Double-buffering the ring (publish batch n+1 while batch n's
+#   copies drain) is the obvious candidate, but measure before building: the
+#   Python per-chunk copy in _pread_into has not been ruled out as the cap.
 # * Budgeting. The fit planner charges DEVICE memory: the batch's chunk buffers
 #   are charged (group_size of them are live per in-flight batch under staging).
 #   The host ring (size x slot_bytes) is NOT charged there -- it is a different
