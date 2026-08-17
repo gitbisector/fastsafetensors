@@ -48,7 +48,17 @@ class _FakeGroup:
         return self._rank
 
 
+# Device under test. Defaults to CPU so the suite stays GPU-free in CI; set
+# FST_TEST_DEVICE=cuda:0 to exercise SharedHostCopier._copy's memcpy_h2d_async
+# branch, which the CPU path never reaches.
+_DEV = os.environ.get("FST_TEST_DEVICE", "cpu")
+
+
 def _tensor_digest(t) -> str:
+    # .cpu() so the same digest works for device tensors -- with FST_TEST_DEVICE=cuda:0
+    # this is what compares the memcpy_h2d_async result against the reference path.
+    if hasattr(t, "cpu"):
+        t = t.cpu()
     return hashlib.sha256(t.numpy().tobytes()).hexdigest()
 
 
@@ -85,7 +95,13 @@ def _make_files(framework, tmp_dir, count, tensors_per_file=6):
 
 
 def _reference(files, framework, **kwargs):
-    """Digests from the unmodified single-process path (no staging at all)."""
+    """Digests from the unmodified single-process path (no staging at all).
+
+    Always CPU: this runs in the parent, and initialising CUDA here would poison
+    fork() for the staged ranks ("Cannot re-initialize CUDA in forked
+    subprocess"). Digests are device-independent, so a CPU reference is still a
+    valid byte-identity target for device-staged delivery.
+    """
     loader = ParallelLoader(
         None, files, device="cpu", nogds=True, framework=framework.get_name(), **kwargs
     )
@@ -100,7 +116,7 @@ def _staged_worker(rank, size, files, barrier, tag, out, framework_name, kwargs)
         loader = ParallelLoader(
             _FakeGroup(size, rank),
             files,
-            device="cpu",
+            device=_DEV,
             nogds=True,
             framework=framework_name,
             shared_host=True,
@@ -117,7 +133,10 @@ def _staged_worker(rank, size, files, barrier, tag, out, framework_name, kwargs)
 
 
 def _run_staged(size, files, tag, framework, **kwargs):
-    ctx = mp.get_context("fork")
+    # fork() cannot carry a CUDA context, and the session fixture initialises one
+    # in the parent whenever a GPU is visible. Spawn for device runs; the worker
+    # args (barrier, manager dict, framework NAME) are all picklable.
+    ctx = mp.get_context("fork" if _DEV == "cpu" else "spawn")
     barrier = ctx.Barrier(size)
     mgr = ctx.Manager()
     out = mgr.dict()
@@ -203,7 +222,7 @@ def test_shared_host_is_a_noop_for_a_single_process(tmp_dir, framework):
     loader = ParallelLoader(
         None,
         files,
-        device="cpu",
+        device=_DEV,
         nogds=True,
         framework=framework.get_name(),
         shared_host=True,
@@ -234,7 +253,7 @@ def _planner_worker(rank, size, files, barrier, tag, out, framework_name, budget
             loader = ParallelLoader(
                 _FakeGroup(size, rank),
                 files,
-                device="cpu",
+                device=_DEV,
                 nogds=True,
                 framework=framework_name,
                 shared_host=True,
@@ -268,7 +287,10 @@ def test_shared_host_charges_the_planner_for_the_whole_group(tmp_dir, framework)
     files = _make_files(framework, tmp_dir, count=size)
     expected = _reference(files, framework)
 
-    ctx = mp.get_context("fork")
+    # fork() cannot carry a CUDA context, and the session fixture initialises one
+    # in the parent whenever a GPU is visible. Spawn for device runs; the worker
+    # args (barrier, manager dict, framework NAME) are all picklable.
+    ctx = mp.get_context("fork" if _DEV == "cpu" else "spawn")
     barrier = ctx.Barrier(size)
     mgr = ctx.Manager()
     out = mgr.dict()
@@ -309,7 +331,7 @@ def test_shared_host_with_no_files_builds_no_ring(framework):
     loader = ParallelLoader(
         _FakeGroup(2, 0),
         [],
-        device="cpu",
+        device=_DEV,
         nogds=True,
         framework=framework.get_name(),
         shared_host=True,
@@ -329,7 +351,7 @@ def test_shared_host_rejects_incompatible_options(tmp_dir, framework):
         ParallelLoader(
             None,
             files,
-            device="cpu",
+            device=_DEV,
             nogds=True,
             framework=framework.get_name(),
             shared_host=True,
@@ -339,7 +361,7 @@ def test_shared_host_rejects_incompatible_options(tmp_dir, framework):
         ParallelLoader(
             _FakeGroup(2, 0),
             files,
-            device="cpu",
+            device=_DEV,
             nogds=True,
             framework=framework.get_name(),
             shared_host=True,
