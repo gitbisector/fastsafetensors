@@ -12,20 +12,39 @@ leaves storage exactly once and all ranks read in parallel. What costs is the
 *delivery* -- every rank must end up with every tensor, and today that means a
 cross-rank broadcast.
 
-Measured on a 155.42 GiB checkpoint, TP=2, single node, one NVMe:
-
-    all_local=True   (every rank reads everything) ...........  41.3 s
-    broadcast        (read once, redistribute over interconnect) 336 s
-    shared-host      (read once, redistribute via host memory) .. ~23 s [1]
-
-[1] measured with an equivalent consumer-side prototype; see the RFC notes.
-
 When the ranks are on the same node the broadcast is avoidable entirely: publish
 each shard into a host buffer every rank maps, and the redistribution becomes
 addressing rather than transfer. Storage is the scarce resource (this NVMe peaks
 at ~9.2 GB/s; a single reader gets only ~1.96 GB/s), so reading once with N
-parallel readers and paying nothing to redistribute is strictly better than either
-existing mode -- on one node.
+parallel readers and paying nothing to redistribute should beat either existing
+mode on one node.
+
+Measured, end to end
+--------------------
+A 155.42 GiB checkpoint, TP=2, single node, one NVMe, two model-loading passes.
+Both arms are the same library build and read the same bytes -- no tensor_filter
+in either, since staging cannot take one (see the RFC notes):
+
+    delivery                       load     read from disk   effective
+    all_local (every rank reads)   89.8 s       606.3 GiB     6.77 GiB/s
+    shared-host staging            79.4 s       331.2 GiB     4.18 GiB/s
+
+Reads fall 1.83x, which is exactly the rank duplication this removes and is the
+proof the mechanism does what it claims. Wall clock falls only 1.13x, because at
+this point reads are no longer the bottleneck.
+
+What the gap is: a consumer-side prototype that stages the same way but
+double-buffers -- reading the next shard while the current one DMAs -- reads
+essentially the same bytes (319.8 GiB) and finishes in 53.9 s, 1.47x faster than
+this wiring. The difference is not bytes, it is overlap: _publish_batch barriers,
+then every rank copies, then the next read starts, so disk and H2D never run at
+the same time. Fixing that is the next thing worth doing here, and it is worth
+more than the byte saving already banked.
+
+(An earlier version of this file claimed ~23 s for shared-host staging. That was
+a consumer-side prototype figure measured in a different regime -- one pass, with
+a name filter that skipped the checkpoint's MTP layers -- and it is NOT what this
+wiring delivers. It is superseded by the table above.)
 
 What this adds
 --------------
@@ -296,6 +315,18 @@ def _pread_into(path: str, mm, spans, threads: int) -> None:
 #   plan (_create_batches) is unchanged. Still open: this ring is per-node only,
 #   and the caller must know its ranks are co-located -- node_key() is not yet
 #   checked across the group (no all-gather in the pg abstraction).
+# * tensor_filter is REJECTED under staging, and that is the first thing a real
+#   consumer hits. Publication stages absolute byte ranges, so a per-rank filter
+#   would have to agree across ranks about what is in each slot; rejecting it was
+#   the conservative choice. But the first production model this was pointed at
+#   (a 155 GiB MoE with a speculative-decoding draft in the same checkpoint)
+#   carries a name filter of its own, and skipping those reads is worth MORE than
+#   staging is: with the filter the same load takes 32.1 s, against 79.4 s staged
+#   without it. So filter support is a prerequisite for adoption, not a
+#   refinement -- as it stands a consumer must choose between the two wins.
+# * Overlap. Reads and H2D are serialized by the publish barrier; see the
+#   measured table above. Double-buffering the ring (publish batch n+1 while the
+#   copies for batch n drain) is the single biggest remaining win.
 # * Budgeting. The fit planner charges DEVICE memory: the batch's chunk buffers
 #   are charged (group_size of them are live per in-flight batch under staging).
 #   The host ring (size x slot_bytes) is NOT charged there -- it is a different
