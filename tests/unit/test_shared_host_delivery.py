@@ -132,7 +132,37 @@ def _staged_worker(rank, size, files, barrier, tag, out, framework_name, kwargs)
         out[rank] = f"ERROR {traceback.format_exc()}"
 
 
-def _run_staged(size, files, tag, framework, **kwargs):
+def _slow_reader_worker(rank, size, files, barrier, tag, out, framework_name, kwargs):
+    """``_staged_worker``, but ``_slow_rank`` dawdles inside its first copy.
+
+    Reading out of the ring is what races with a peer's next publish, so the
+    delay goes in the copier rather than around the loader: it widens the window
+    in which this rank is demonstrably still reading a slot its owner is free to
+    overwrite.
+    """
+    slow_rank = kwargs.pop("_slow_rank")
+    delay = kwargs.pop("_delay")
+    if rank == slow_rank:
+        import time
+
+        from fastsafetensors.copier import host_staged
+
+        real_copy = host_staged.SharedHostCopier._copy
+        state = {"slept": False}
+
+        def slow_copy(self, dst, start, length):
+            # Once, on the first copy of the run: batch 0's files are copied in
+            # sorted order, so this is the copy that reads the peer's slot.
+            if not state["slept"]:
+                state["slept"] = True
+                time.sleep(delay)
+            real_copy(self, dst, start, length)
+
+        host_staged.SharedHostCopier._copy = slow_copy
+    _staged_worker(rank, size, files, barrier, tag, out, framework_name, kwargs)
+
+
+def _run_staged(size, files, tag, framework, worker=_staged_worker, **kwargs):
     # fork() cannot carry a CUDA context, and the session fixture initialises one
     # in the parent whenever a GPU is visible. Spawn for device runs; the worker
     # args (barrier, manager dict, framework NAME) are all picklable.
@@ -142,7 +172,7 @@ def _run_staged(size, files, tag, framework, **kwargs):
     out = mgr.dict()
     procs = [
         ctx.Process(
-            target=_staged_worker,
+            target=worker,
             args=(r, size, files, barrier, tag, out, framework.get_name(), kwargs),
         )
         for r in range(size)
@@ -212,6 +242,34 @@ def test_staged_delivery_deep_queue(tmp_dir, framework):
     kwargs = {"queue_size": 2}
     expected = _reference(files, framework, **kwargs)
     got = _run_staged(size, files, _tag("queued"), framework, **kwargs)
+    _assert_identical(got, expected, size)
+
+
+def test_publish_waits_for_the_previous_batch_readers(tmp_dir, framework):
+    """A rank must not refill its slot while a peer still reads the last batch.
+
+    Slots are reused every batch, and nothing in the loader couples one rank's
+    progress to another's: rank 0 can finish batch 0 and reach batch 1's publish
+    while rank 1 is still copying batch 0 -- half of which lives in *rank 0's*
+    slot. The pre-publish barrier in ``_publish_batch`` is what closes that
+    window, and every other test here passes with it deleted, so this is the one
+    that holds it in place. Delaying rank 1's first copy makes the window wide
+    enough that the outcome is decided by the barrier, not by scheduling luck.
+    """
+    size = 2
+    files = _make_files(framework, tmp_dir, count=4)  # 2 batches, so slots recycle
+    expected = _reference(files, framework)
+    got = _run_staged(
+        size,
+        files,
+        _tag("racy"),
+        framework,
+        worker=_slow_reader_worker,
+        _slow_rank=1,
+        _delay=2.0,
+    )
+    # Without the barrier rank 1 reads batch 1's shard out of rank 0's slot, so
+    # it reports a full key set with wrong bytes -- caught by digest, not by count.
     _assert_identical(got, expected, size)
 
 

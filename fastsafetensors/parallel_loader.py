@@ -472,9 +472,15 @@ class PipelineParallel:
             staged[path] = self._ring.slot_address(rank)
         # Guard the PREVIOUS batch's readers: this rank is about to overwrite
         # its slot and a peer may still be copying out of it. Every rank's
-        # copy_files_to_device runs to completion inside _load_single_batch, so
-        # arriving here means every rank has finished the previous batch.
-        # publish() barriers on the way out, which is what publishes the bytes.
+        # copy_files_to_device runs to completion inside _load_single_batch --
+        # it wait_io()s every factory it submitted, which for the staged copier
+        # synchronizes the device -- so arriving here means every rank has both
+        # issued AND drained the previous batch's copies. publish() barriers on
+        # the way out, which is what publishes the bytes.
+        # Deleting this line corrupts silently (a full key set, wrong bytes):
+        # tests/unit/test_shared_host_delivery.py::
+        # test_publish_waits_for_the_previous_batch_readers is the only test
+        # that catches it.
         self._barrier_fn()
         self._ring.publish(batch, ranges=ranges)
         self.loader._set_staged_sources(staged)
