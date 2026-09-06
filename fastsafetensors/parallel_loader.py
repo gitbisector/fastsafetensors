@@ -203,6 +203,10 @@ class PipelineParallel:
         # Single-process yields borrow the file buffer and require a clone.
         self.need_clone = pg.size() == 1
 
+        # Before _create_batches, which reports any queue_size clamp.
+        self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
+        self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
+
         # Batch files (or, with max_batch_bytes / device_memory_budget,
         # sub-file chunk-batches)
         self.weight_files_batches = self._create_batches(pg)
@@ -210,8 +214,13 @@ class PipelineParallel:
         # Producer-consumer communication
         # For unbuffered behavior (queue_size=0), we use a maxsize of 1 to ensure synchronization
         # but modify the producer logic to wait for consumer to process before producing next
+        # self.queue_size, not the parameter: _create_batches may have clamped
+        # it, and the runtime handshake paths read the attribute. Sizing these
+        # from the parameter would run the pipeline deeper than it was budgeted
+        # for -- a clamp from 3 to -1 would leave consumer_processed None and
+        # skip the serial handshake entirely.
         self.batch_queue: queue.Queue[Union[FileBatch, Exception, None]] = queue.Queue(
-            maxsize=max(1, queue_size)
+            maxsize=max(1, self.queue_size)
         )  # Ensure at least size 1
         self.stop_event = threading.Event()
         self.error_event = threading.Event()
@@ -219,14 +228,11 @@ class PipelineParallel:
 
         # For unbuffered behavior, we need additional synchronization
         self.consumer_processed: Optional[threading.Event] = (
-            threading.Event() if queue_size <= 0 else None
+            threading.Event() if self.queue_size <= 0 else None
         )
-        if queue_size <= 0 and self.consumer_processed is not None:
+        if self.queue_size <= 0 and self.consumer_processed is not None:
             self.consumer_processed.set()  # Initially set to allow first production
 
-        # Logging setup - get from environment variable, default to False
-        self.print_log = os.getenv("FASTSAFETENSORS_DEBUG", "false").lower() == "true"
-        self.log_prefix = f"PG{pg.rank() if pg is not None else 0}"
         fstcpp.set_gil_release(True)
 
     def _create_batches(self, pg) -> List[List[Any]]:
@@ -261,19 +267,15 @@ class PipelineParallel:
         if self.device_memory_budget is not None:
             from ._planner import (
                 collect_file_stats,
-                pipeline_depth,
+                fit_queue_size,
+                load_depth,
                 plan_file_budgets,
             )
 
             metas = [
                 (f, SafeTensorsMetadata.from_file(f, fw)) for f in self.hf_weights_files
             ]
-            # Broadcast mode adds one in-flight receive tensor (<= one chunk
-            # budget) on top of the live gbufs; the caller passing the same
-            # budget on every rank keeps the plan deterministic across ranks.
-            # batch_size also sets the group width: those files load together,
-            # one per rank, and every rank keeps all of them.
-            depth = pipeline_depth(self.queue_size) + (1 if batch_size > 1 else 0)
+            stats = collect_file_stats(metas, keep)
             account_for_yield_clone = self.need_clone and not self.accumulate_resident
             # How much transient device memory a live chunk costs is the
             # copier's own business (e.g. the unified copier's mmap+pin
@@ -281,8 +283,40 @@ class PipelineParallel:
             # costing 2x span on a shared physical pool), so ask it.
             copier = self.loader.copier_class
             multiplier = copier.chunk_transient_multiplier([f for f, _ in metas])
+            # Too small a budget for the requested depth is a reason to load
+            # more shallowly, not to fail: the budget comes from free memory at
+            # load time while queue_size is static, so nobody can pick the right
+            # depth in advance. Inputs are header-derived and the budget is
+            # identical on every rank, so all ranks clamp alike -- the lockstep
+            # broadcast needs no collective to agree.
+            fitted = fit_queue_size(
+                self.queue_size,
+                stats,
+                self.device_memory_budget,
+                max_batch_bytes=self.max_batch_bytes,
+                accumulate_resident=self.accumulate_resident,
+                transient_multiplier=multiplier,
+                group_size=batch_size,
+                account_for_yield_clone=account_for_yield_clone,
+            )
+            if fitted is None:
+                # No depth fits. Plan serially anyway, so the error reports the
+                # smallest shortfall -- the bytes the user must actually free.
+                self.queue_size = -1
+            elif fitted < self.queue_size:
+                self._log_message(
+                    f"device_memory_budget={self.device_memory_budget} does not "
+                    f"fit queue_size={self.queue_size}; loading with "
+                    f"queue_size={fitted} instead. Free device memory or raise "
+                    f"the budget to keep a deeper pipeline.",
+                    is_error=True,  # a silent throughput cut is worse
+                )
+                self.queue_size = fitted
+            # batch_size also sets the group width: those files load together,
+            # one per rank, and every rank keeps all of them.
+            depth = load_depth(self.queue_size, batch_size)
             budgets = plan_file_budgets(
-                collect_file_stats(metas, keep),
+                stats,
                 self.device_memory_budget,
                 depth,
                 max_batch_bytes=self.max_batch_bytes,
