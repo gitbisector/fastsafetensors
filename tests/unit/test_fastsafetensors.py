@@ -526,6 +526,28 @@ def test_is_unified_memory_system(
         assert is_unified_memory_system(None) is False
 
 
+@pytest.mark.parametrize("release", ["1", "0"])
+def test_free_tensor_memory_releases_pool(monkeypatch, framework, release) -> None:
+    # On unified memory the caching allocator's pool is host RAM, so a freed
+    # load buffer must go back to the driver, not stay reserved (#94).
+    if framework.get_name() != "pytorch" or not is_gpu_found():
+        pytest.skip("needs pytorch and a CUDA device")
+    import torch
+
+    from fastsafetensors.frameworks._torch import TorchOp
+
+    monkeypatch.setenv("FASTSAFETENSORS_RELEASE_POOL", release)
+    op = TorchOp()
+    dev = Device.from_str("cuda:0")
+    torch.cuda.empty_cache()
+    before = torch.cuda.memory_reserved()
+    gbuf = op.alloc_tensor_memory(64 << 20, dev)
+    op.free_tensor_memory(gbuf, dev)
+    retained = torch.cuda.memory_reserved() - before
+    torch.cuda.empty_cache()
+    assert (retained == 0) == (release == "1")
+
+
 @pytest.mark.parametrize(
     "device_str,nogds,use_fgds,unified_env,expected_type",
     [

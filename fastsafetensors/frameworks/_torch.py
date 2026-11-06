@@ -309,6 +309,7 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
 
     def __init__(self) -> None:
         self.mem_used = 0
+        self._release_pool: Optional[bool] = None
 
     def get_name(self) -> str:
         return "pytorch"
@@ -333,9 +334,30 @@ class TorchOp(FrameworkOpBase[TorchTensor, TorchProcessGroup]):
         length = gbuf.get_length()
         if dev.type == DeviceType.CUDA:
             torch.cuda.caching_allocator_delete(gbuf.get_base_address())
+            if self._should_release_pool():
+                torch.cuda.empty_cache()
         else:
             cpu_free(gbuf.get_base_address())
         self.mem_used -= length
+
+    def _should_release_pool(self) -> bool:
+        """Whether a freed buffer goes back to the driver, not just the pool.
+
+        ``caching_allocator_delete`` keeps the block in PyTorch's caching
+        allocator. On unified memory that pool is host RAM, so a retained
+        buffer stays unavailable to the rest of the system after loading
+        (#94). Defaults to on there and off on discrete GPUs;
+        ``FASTSAFETENSORS_RELEASE_POOL=0|1`` overrides.
+        """
+        if self._release_pool is None:
+            override = os.environ.get("FASTSAFETENSORS_RELEASE_POOL")
+            if override is not None:
+                self._release_pool = override == "1"
+            else:
+                from ..copier.unified import is_unified_memory_system
+
+                self._release_pool = is_unified_memory_system(self)
+        return self._release_pool
 
     def get_empty_tensor(
         self, shape: List[int], dtype: DType, device: Device
