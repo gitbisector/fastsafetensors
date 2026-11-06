@@ -275,9 +275,15 @@ class BaseSafeTensorsFileLoader:
                         else:
                             copier.set_chunk(ranges, names, allocation_size)
                     elif self._tensor_filter is not None:
-                        copier.set_byte_ranges(
-                            meta.select_byte_ranges(self._tensor_filter)
-                        )
+                        # Load the kept tensors as a compact chunk: a sparse
+                        # read into a whole-shard buffer would still allocate
+                        # the full shard however little the filter keeps.
+                        ranges = meta.select_byte_ranges(self._tensor_filter)
+                        kept = {n for n in meta.tensors if self._tensor_filter(n)}
+                        try:
+                            copier.set_chunk(ranges, kept)
+                        except NotImplementedError:
+                            copier.set_byte_ranges(ranges)
                 factory.submit_io(
                     use_buf_register,
                     max_copy_block_size,

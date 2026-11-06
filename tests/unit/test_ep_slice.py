@@ -407,6 +407,42 @@ def test_select_byte_ranges_skips_zero_size_tensors(tmp_path, framework):
     loader.close()
 
 
+def test_tensor_filter_allocates_only_kept_span(tmp_path, framework, monkeypatch):
+    # A filter that keeps a small tensor must not stage the whole shard: a
+    # checkpoint with a large tensor left on disk would otherwise OOM.
+    if framework.get_name() != "pytorch":
+        pytest.skip("pytorch-only fixture creation")
+    from safetensors.torch import save_file
+
+    from fastsafetensors import SafeTensorsFileLoader
+    from fastsafetensors.frameworks._torch import TorchOp
+
+    path = str(tmp_path / "skewed.safetensors")
+    save_file(
+        {
+            "big": torch.zeros(4 << 20, dtype=torch.uint8),
+            "small": torch.arange(8.0),
+        },
+        path,
+    )
+    allocs = []
+    alloc = TorchOp.alloc_tensor_memory
+
+    def recording_alloc(self, length, dev):
+        allocs.append(length)
+        return alloc(self, length, dev)
+
+    monkeypatch.setattr(TorchOp, "alloc_tensor_memory", recording_alloc)
+    loader = SafeTensorsFileLoader(None, "cpu", nogds=True, framework="pytorch")
+    loader.set_tensor_filter(lambda n: n == "small")
+    loader.add_filenames({0: [path]})
+    fb = loader.copy_files_to_device()
+    assert torch.equal(fb.get_tensor("small"), torch.arange(8.0))
+    assert max(allocs) < 1 << 20
+    fb.close()
+    loader.close()
+
+
 def test_set_byte_ranges_rejects_bool_offsets(input_files, framework):
     meta = SafeTensorsMetadata.from_file(input_files[0], framework)
     reader = fstcpp.nogds_file_reader(False, 16 * 1024, 1, False, 0)
